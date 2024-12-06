@@ -379,6 +379,7 @@ func MachineTemplateUpToDate(current, desired *clusterv1.MachineTemplateSpec) (u
 
 	if !reflect.DeepEqual(currentCopy.Spec.Version, desiredCopy.Spec.Version) {
 		logMessages = append(logMessages, fmt.Sprintf("spec.version %s, %s required", ptr.Deref(currentCopy.Spec.Version, "nil"), ptr.Deref(desiredCopy.Spec.Version, "nil")))
+		// Note: the code computing the message for MachineDeployment's RolloutOut condition is making assumptions on the format/content of this message.
 		conditionMessages = append(conditionMessages, fmt.Sprintf("Version %s, %s required", ptr.Deref(currentCopy.Spec.Version, "nil"), ptr.Deref(desiredCopy.Spec.Version, "nil")))
 	}
 
@@ -438,9 +439,12 @@ func MachineTemplateDeepCopyRolloutFields(template *clusterv1.MachineTemplateSpe
 
 	// Remove the version part from the references APIVersion field,
 	// for more details see issue #2183 and #2140.
+	// Remove namespace part of the ref, as it always correllates with current MD namespace
 	templateCopy.Spec.InfrastructureRef.APIVersion = templateCopy.Spec.InfrastructureRef.GroupVersionKind().Group
+	templateCopy.Spec.InfrastructureRef.Namespace = ""
 	if templateCopy.Spec.Bootstrap.ConfigRef != nil {
 		templateCopy.Spec.Bootstrap.ConfigRef.APIVersion = templateCopy.Spec.Bootstrap.ConfigRef.GroupVersionKind().Group
+		templateCopy.Spec.Bootstrap.ConfigRef.Namespace = ""
 	}
 
 	return templateCopy

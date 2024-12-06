@@ -156,12 +156,14 @@ func TestWatches(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -292,12 +294,14 @@ func TestWatchesDelete(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -442,12 +446,14 @@ func TestMachine_Reconcile(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -861,6 +867,7 @@ func TestReconcileRequest(t *testing.T) {
 						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericInfrastructureMachine",
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -890,6 +897,7 @@ func TestReconcileRequest(t *testing.T) {
 						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericInfrastructureMachine",
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -923,6 +931,7 @@ func TestReconcileRequest(t *testing.T) {
 						APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericInfrastructureMachine",
 						Name:       "infra-config1",
+						Namespace:  metav1.NamespaceDefault,
 					},
 					Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 				},
@@ -1041,12 +1050,14 @@ func TestMachineConditions(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config1",
+					Namespace:  metav1.NamespaceDefault,
 				},
 			},
 		},
@@ -1289,6 +1300,7 @@ func TestRemoveMachineFinalizerAfterDeleteReconcile(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 		},
@@ -1334,6 +1346,55 @@ func TestIsNodeDrainedAllowed(t *testing.T) {
 					Namespace:   metav1.NamespaceDefault,
 					Finalizers:  []string{clusterv1.MachineFinalizer},
 					Annotations: map[string]string{clusterv1.ExcludeNodeDrainingAnnotation: "existed!!"},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: false,
+		},
+		{
+			name: "KCP machine with the pre terminate hook should drain",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-machine",
+					Namespace:   metav1.NamespaceDefault,
+					Labels:      map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					Annotations: map[string]string{KubeadmControlPlanePreTerminateHookCleanupAnnotation: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: KubeadmControlPlaneAPIVersion,
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: true,
+		},
+		{
+			name: "KCP machine without the pre terminate hook should stop draining",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-machine",
+					Namespace: metav1.NamespaceDefault,
+					Labels:    map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: KubeadmControlPlaneAPIVersion,
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
 				},
 				Spec: clusterv1.MachineSpec{
 					ClusterName:       "test-cluster",
@@ -1846,6 +1907,55 @@ func TestIsNodeVolumeDetachingAllowed(t *testing.T) {
 					Namespace:   metav1.NamespaceDefault,
 					Finalizers:  []string{clusterv1.MachineFinalizer},
 					Annotations: map[string]string{clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation: "existed!!"},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: false,
+		},
+		{
+			name: "KCP machine with the pre terminate hook should wait",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-machine",
+					Namespace:   metav1.NamespaceDefault,
+					Labels:      map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					Annotations: map[string]string{KubeadmControlPlanePreTerminateHookCleanupAnnotation: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: KubeadmControlPlaneAPIVersion,
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
+				},
+				Spec: clusterv1.MachineSpec{
+					ClusterName:       "test-cluster",
+					InfrastructureRef: corev1.ObjectReference{},
+					Bootstrap:         clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
+				},
+				Status: clusterv1.MachineStatus{},
+			},
+			expected: true,
+		},
+		{
+			name: "KCP machine without the pre terminate hook should stop waiting",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-machine",
+					Namespace: metav1.NamespaceDefault,
+					Labels:    map[string]string{clusterv1.MachineControlPlaneLabel: ""},
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: KubeadmControlPlaneAPIVersion,
+							Kind:       "KubeadmControlPlane",
+							Name:       "Foo",
+						},
+					},
 				},
 				Spec: clusterv1.MachineSpec{
 					ClusterName:       "test-cluster",
@@ -2921,12 +3031,14 @@ func TestNodeToMachine(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  ns.Name,
 			},
 			Bootstrap: clusterv1.Bootstrap{
 				ConfigRef: &corev1.ObjectReference{
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config-machinereconcile",
+					Namespace:  ns.Name,
 				},
 			},
 		},
@@ -3098,6 +3210,7 @@ func TestNodeDeletion(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap: clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 		},
@@ -3294,6 +3407,7 @@ func TestNodeDeletionWithoutNodeRefFallback(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 			Bootstrap:  clusterv1.Bootstrap{DataSecretName: ptr.To("data")},
 			ProviderID: ptr.To("test://id-1"),

@@ -114,6 +114,10 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 	if err != nil {
 		return err
 	}
+	mdToMachineSets, err := util.MachineDeploymentToObjectsMapper(mgr.GetClient(), &clusterv1.MachineSetList{}, mgr.GetScheme())
+	if err != nil {
+		return err
+	}
 
 	err = ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.MachineSet{}).
@@ -122,6 +126,10 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.MachineToMachineSets),
+		).
+		Watches(
+			&clusterv1.MachineDeployment{},
+			handler.EnqueueRequestsFromMapFunc(mdToMachineSets),
 		).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
@@ -272,7 +280,7 @@ type scope struct {
 	infrastructureObjectNotFound              bool
 	getAndAdoptMachinesForMachineSetSucceeded bool
 	owningMachineDeployment                   *clusterv1.MachineDeployment
-	scaleUpPreflightCheckErrMessage           string
+	scaleUpPreflightCheckErrMessages          []string
 	reconciliationTime                        time.Time
 }
 
@@ -554,7 +562,7 @@ func (r *Reconciler) syncMachines(ctx context.Context, s *scope) (ctrl.Result, e
 		}
 		machines[i] = updatedMachine
 
-		infraMachine, err := external.Get(ctx, r.Client, &updatedMachine.Spec.InfrastructureRef, updatedMachine.Namespace)
+		infraMachine, err := external.Get(ctx, r.Client, &updatedMachine.Spec.InfrastructureRef)
 		if err != nil {
 			return ctrl.Result{}, errors.Wrapf(err, "failed to get InfrastructureMachine %s",
 				klog.KRef(updatedMachine.Spec.InfrastructureRef.Namespace, updatedMachine.Spec.InfrastructureRef.Name))
@@ -576,7 +584,7 @@ func (r *Reconciler) syncMachines(ctx context.Context, s *scope) (ctrl.Result, e
 		}
 
 		if updatedMachine.Spec.Bootstrap.ConfigRef != nil {
-			bootstrapConfig, err := external.Get(ctx, r.Client, updatedMachine.Spec.Bootstrap.ConfigRef, updatedMachine.Namespace)
+			bootstrapConfig, err := external.Get(ctx, r.Client, updatedMachine.Spec.Bootstrap.ConfigRef)
 			if err != nil {
 				return ctrl.Result{}, errors.Wrapf(err, "failed to get BootstrapConfig %s",
 					klog.KRef(updatedMachine.Spec.Bootstrap.ConfigRef.Namespace, updatedMachine.Spec.Bootstrap.ConfigRef.Name))
@@ -633,11 +641,15 @@ func newMachineUpToDateCondition(s *scope) *metav1.Condition {
 	}
 
 	if !upToDate {
+		for i := range conditionMessages {
+			conditionMessages[i] = fmt.Sprintf("* %s", conditionMessages[i])
+		}
 		return &metav1.Condition{
-			Type:    clusterv1.MachineUpToDateV1Beta2Condition,
-			Status:  metav1.ConditionFalse,
-			Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-			Message: strings.Join(conditionMessages, "; "),
+			Type:   clusterv1.MachineUpToDateV1Beta2Condition,
+			Status: metav1.ConditionFalse,
+			Reason: clusterv1.MachineNotUpToDateV1Beta2Reason,
+			// Note: the code computing the message for MachineDeployment's RolloutOut condition is making assumptions on the format/content of this message.
+			Message: strings.Join(conditionMessages, "\n"),
 		}
 	}
 
@@ -673,15 +685,19 @@ func (r *Reconciler) syncReplicas(ctx context.Context, s *scope) (ctrl.Result, e
 			}
 		}
 
-		result, preflightCheckErrMessage, err := r.runPreflightChecks(ctx, cluster, ms, "Scale up")
-		if err != nil || !result.IsZero() {
+		preflightCheckErrMessages, err := r.runPreflightChecks(ctx, cluster, ms, "Scale up")
+		if err != nil || len(preflightCheckErrMessages) > 0 {
 			if err != nil {
-				// If the error is not nil use that as the message for the condition.
-				preflightCheckErrMessage = err.Error()
+				// If err is not nil use that as the preflightCheckErrMessage
+				preflightCheckErrMessages = append(preflightCheckErrMessages, err.Error())
 			}
-			s.scaleUpPreflightCheckErrMessage = preflightCheckErrMessage
-			conditions.MarkFalse(ms, clusterv1.MachinesCreatedCondition, clusterv1.PreflightCheckFailedReason, clusterv1.ConditionSeverityError, preflightCheckErrMessage)
-			return result, err
+
+			s.scaleUpPreflightCheckErrMessages = preflightCheckErrMessages
+			conditions.MarkFalse(ms, clusterv1.MachinesCreatedCondition, clusterv1.PreflightCheckFailedReason, clusterv1.ConditionSeverityError, strings.Join(preflightCheckErrMessages, "; "))
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: preflightFailedRequeueAfter}, nil
 		}
 
 		var (
@@ -1418,31 +1434,39 @@ func (r *Reconciler) reconcileUnhealthyMachines(ctx context.Context, s *scope) (
 	}
 
 	// Run preflight checks.
-	preflightChecksResult, preflightCheckErrMessage, err := r.runPreflightChecks(ctx, cluster, ms, "Machine remediation")
-	if err != nil {
-		// If err is not nil use that as the preflightCheckErrMessage
-		preflightCheckErrMessage = err.Error()
-	}
+	preflightCheckErrMessages, err := r.runPreflightChecks(ctx, cluster, ms, "Machine remediation")
+	if err != nil || len(preflightCheckErrMessages) > 0 {
+		if err != nil {
+			// If err is not nil use that as the preflightCheckErrMessage
+			preflightCheckErrMessages = append(preflightCheckErrMessages, err.Error())
+		}
 
-	preflightChecksFailed := err != nil || !preflightChecksResult.IsZero()
-	if preflightChecksFailed {
+		listMessages := make([]string, len(preflightCheckErrMessages))
+		for i, msg := range preflightCheckErrMessages {
+			listMessages[i] = fmt.Sprintf("* %s", msg)
+		}
+
 		// PreflightChecks did not pass. Update the MachineOwnerRemediated condition on the unhealthy Machines with
 		// WaitingForRemediationReason reason.
-		if err := patchMachineConditions(ctx, r.Client, machinesToRemediate, metav1.Condition{
+		if patchErr := patchMachineConditions(ctx, r.Client, machinesToRemediate, metav1.Condition{
 			Type:    clusterv1.MachineOwnerRemediatedV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
 			Reason:  clusterv1.MachineSetMachineRemediationDeferredV1Beta2Reason,
-			Message: preflightCheckErrMessage,
+			Message: strings.Join(listMessages, "\n"),
 		}, &clusterv1.Condition{
 			Type:     clusterv1.MachineOwnerRemediatedCondition,
 			Status:   corev1.ConditionFalse,
 			Reason:   clusterv1.WaitingForRemediationReason,
 			Severity: clusterv1.ConditionSeverityWarning,
-			Message:  preflightCheckErrMessage,
-		}); err != nil {
+			Message:  strings.Join(preflightCheckErrMessages, "; "),
+		}); patchErr != nil {
+			return ctrl.Result{}, kerrors.NewAggregate([]error{err, patchErr})
+		}
+
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		return preflightChecksResult, nil
+		return ctrl.Result{RequeueAfter: preflightFailedRequeueAfter}, nil
 	}
 
 	// PreflightChecks passed, so it is safe to remediate unhealthy machines by deleting them.
@@ -1516,7 +1540,13 @@ func (r *Reconciler) reconcileExternalTemplateReference(ctx context.Context, clu
 		return false, err
 	}
 
-	obj, err := external.Get(ctx, r.Client, ref, cluster.Namespace)
+	// Ensure the ref namespace is populated for objects not yet defaulted by webhook
+	if ref.Namespace == "" {
+		ref = ref.DeepCopy()
+		ref.Namespace = cluster.Namespace
+	}
+
+	obj, err := external.Get(ctx, r.Client, ref)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			if !ms.DeletionTimestamp.IsZero() {
