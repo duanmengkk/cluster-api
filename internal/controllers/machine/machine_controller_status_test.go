@@ -49,6 +49,7 @@ func TestSetBootstrapReadyCondition(t *testing.T) {
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config1",
+					Namespace:  metav1.NamespaceDefault,
 				},
 			},
 		},
@@ -297,6 +298,7 @@ func TestSetInfrastructureReadyCondition(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-machine1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 		},
 	}
@@ -556,12 +558,9 @@ func TestSummarizeNodeV1Beta2Conditions(t *testing.T) {
 				{Type: corev1.NodeDiskPressure, Status: corev1.ConditionUnknown, Message: "Node is not reporting status"},
 				{Type: corev1.NodePIDPressure, Status: corev1.ConditionUnknown, Message: "Node is not reporting status"},
 			},
-			expectedStatus: metav1.ConditionUnknown,
-			expectedReason: clusterv1.MachineNodeHealthUnknownV1Beta2Reason,
-			expectedMessage: "* Node.Ready: Node is not reporting status\n" +
-				"* Node.MemoryPressure: Node is not reporting status\n" +
-				"* Node.DiskPressure: Node is not reporting status\n" +
-				"* Node.PIDPressure: Node is not reporting status",
+			expectedStatus:  metav1.ConditionUnknown,
+			expectedReason:  clusterv1.MachineNodeHealthUnknownV1Beta2Reason,
+			expectedMessage: "* Node.AllConditions: Node is not reporting status",
 		},
 		{
 			name: "multiple semantically failed condition",
@@ -646,6 +645,7 @@ func TestSetNodeHealthyAndReadyConditions(t *testing.T) {
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-machine1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 		},
 	}
@@ -1218,6 +1218,121 @@ func TestDeletingCondition(t *testing.T) {
 	}
 }
 
+func TestTransformControlPlaneAndEtcdConditions(t *testing.T) {
+	testCases := []struct {
+		name           string
+		messages       []string
+		expectMessages []string
+	}{
+		{
+			name: "no-op without control plane conditions",
+			messages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.InfrastructureReadyV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineNodeHealthyV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineDeletingV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineHealthCheckSucceededV1Beta2Condition),
+			},
+			expectMessages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.InfrastructureReadyV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineNodeHealthyV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineDeletingV1Beta2Condition),
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineHealthCheckSucceededV1Beta2Condition),
+			},
+		},
+		{
+			name: "group control plane conditions when msg are all equal",
+			messages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* ControllerManagerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* SchedulerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething: Waiting for AWSMachine to report spec.providerID",
+			},
+			expectMessages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* Control plane components: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething: Waiting for AWSMachine to report spec.providerID",
+			},
+		},
+		{
+			name: "don't group control plane conditions when msg are not all equal",
+			messages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* ControllerManagerSomething: Some message",
+				"* SchedulerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething:Some message",
+			},
+			expectMessages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* ControllerManagerSomething: Some message",
+				"* SchedulerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething:Some message",
+			},
+		},
+		{
+			name: "don't group control plane conditions when there is only one condition",
+			messages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething:Some message",
+			},
+			expectMessages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething:Some message",
+			},
+		},
+		{
+			name: "Treat EtcdPodHealthy as a special case (it groups with control plane components)",
+			messages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* ControllerManagerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* SchedulerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdPodHealthy: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething: Some message",
+			},
+			expectMessages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* Control plane components: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdSomething: Some message",
+			},
+		},
+		{
+			name: "Treat EtcdPodHealthy as a special case (it does not group with other etcd conditions)",
+			messages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* ControllerManagerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* SchedulerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdPodHealthy: Some message",
+				"* EtcdSomething: Some message",
+			},
+			expectMessages: []string{
+				fmt.Sprintf("* %s: Foo", clusterv1.MachineBootstrapConfigReadyV1Beta2Condition),
+				"* APIServerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* ControllerManagerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* SchedulerSomething: Waiting for AWSMachine to report spec.providerID",
+				"* EtcdPodHealthy: Some message",
+				"* EtcdSomething: Some message",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			got := transformControlPlaneAndEtcdConditions(tc.messages)
+			g.Expect(got).To(Equal(tc.expectMessages))
+		})
+	}
+}
+
 func TestSetReadyCondition(t *testing.T) {
 	testCases := []struct {
 		name            string
@@ -1414,9 +1529,7 @@ func TestSetReadyCondition(t *testing.T) {
 				},
 				Spec: clusterv1.MachineSpec{
 					ReadinessGates: []clusterv1.MachineReadinessGate{
-						{
-							ConditionType: "MyReadinessGate",
-						},
+						{ConditionType: "MyReadinessGate"},
 					},
 				},
 				Status: clusterv1.MachineStatus{
@@ -1462,6 +1575,78 @@ func TestSetReadyCondition(t *testing.T) {
 				Status:  metav1.ConditionFalse,
 				Reason:  clusterv1.MachineNotReadyV1Beta2Reason,
 				Message: "* MyReadinessGate: Some message",
+			},
+		},
+		{
+			name: "Groups readiness gates for control plane components and etcd member when possible and there is more than one condition for each category",
+			machine: &clusterv1.Machine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "machine-test",
+					Namespace: metav1.NamespaceDefault,
+				},
+				Spec: clusterv1.MachineSpec{
+					ReadinessGates: []clusterv1.MachineReadinessGate{
+						{ConditionType: "APIServerSomething"},
+						{ConditionType: "ControllerManagerSomething"},
+						{ConditionType: "EtcdSomething"},
+					},
+				},
+				Status: clusterv1.MachineStatus{
+					V1Beta2: &clusterv1.MachineV1Beta2Status{
+						Conditions: []metav1.Condition{
+							{
+								Type:   clusterv1.MachineBootstrapConfigReadyV1Beta2Condition,
+								Status: metav1.ConditionTrue,
+								Reason: "Foo",
+							},
+							{
+								Type:   clusterv1.InfrastructureReadyV1Beta2Condition,
+								Status: metav1.ConditionTrue,
+								Reason: "Foo",
+							},
+							{
+								Type:   clusterv1.MachineNodeHealthyV1Beta2Condition,
+								Status: metav1.ConditionTrue,
+								Reason: "Foo",
+							},
+							{
+								Type:   clusterv1.MachineHealthCheckSucceededV1Beta2Condition,
+								Status: metav1.ConditionTrue,
+								Reason: "Foo",
+							},
+							{
+								Type:    "APIServerSomething",
+								Status:  metav1.ConditionFalse,
+								Reason:  "SomeReason",
+								Message: "Some control plane message",
+							},
+							{
+								Type:    "ControllerManagerSomething",
+								Status:  metav1.ConditionFalse,
+								Reason:  "SomeReason",
+								Message: "Some control plane message",
+							},
+							{
+								Type:    "EtcdSomething",
+								Status:  metav1.ConditionFalse,
+								Reason:  "SomeReason",
+								Message: "Some etcd message",
+							},
+							{
+								Type:   clusterv1.MachineDeletingV1Beta2Condition,
+								Status: metav1.ConditionFalse,
+								Reason: clusterv1.MachineNotDeletingV1Beta2Reason,
+							},
+						},
+					},
+				},
+			},
+			expectCondition: metav1.Condition{
+				Type:   clusterv1.MachineReadyV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: clusterv1.MachineNotReadyV1Beta2Reason,
+				Message: "* Control plane components: Some control plane message\n" +
+					"* EtcdSomething: Some etcd message",
 			},
 		},
 	}
@@ -1512,11 +1697,12 @@ func TestCalculateDeletingConditionForSummary(t *testing.T) {
 			},
 		},
 		{
-			name: "Deleting condition with DrainingNode since more than 30m",
+			name: "Deleting condition with DrainingNode since more than 15m",
 			machine: &clusterv1.Machine{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "machine-test",
-					Namespace: metav1.NamespaceDefault,
+					Name:              "machine-test",
+					Namespace:         metav1.NamespaceDefault,
+					DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-16 * time.Minute)},
 				},
 				Status: clusterv1.MachineStatus{
 					V1Beta2: &clusterv1.MachineV1Beta2Status{
@@ -1526,19 +1712,15 @@ func TestCalculateDeletingConditionForSummary(t *testing.T) {
 								Status: metav1.ConditionTrue,
 								Reason: clusterv1.MachineDeletingDrainingNodeV1Beta2Reason,
 								Message: `Drain not completed yet (started at 2024-10-09T16:13:59Z):
-* Pods with deletionTimestamp that still exist: pod-2-deletionTimestamp-set-1, pod-2-deletionTimestamp-set-2, pod-2-deletionTimestamp-set-3, pod-3-to-trigger-eviction-successfully-1, pod-3-to-trigger-eviction-successfully-2, ... (2 more)
-* Pods with eviction failed:
-  * Cannot evict pod as it would violate the pod's disruption budget. The disruption budget pod-5-pdb needs 20 healthy pods and has 20 currently: pod-5-to-trigger-eviction-pdb-violated-1, pod-5-to-trigger-eviction-pdb-violated-2, pod-5-to-trigger-eviction-pdb-violated-3, ... (3 more)
-  * some other error 1: pod-6-to-trigger-eviction-some-other-error
-  * some other error 2: pod-7-to-trigger-eviction-some-other-error
-  * some other error 3: pod-8-to-trigger-eviction-some-other-error
-  * some other error 4: pod-9-to-trigger-eviction-some-other-error
-  * ... (1 more error applying to 1 Pod)`,
+* Pods pod-2-deletionTimestamp-set-1, pod-3-to-trigger-eviction-successfully-1: deletionTimestamp set, but still not removed from the Node
+* Pod pod-5-to-trigger-eviction-pdb-violated-1: cannot evict pod as it would violate the pod's disruption budget. The disruption budget pod-5-pdb needs 20 healthy pods and has 20 currently
+* Pod pod-6-to-trigger-eviction-some-other-error: failed to evict Pod, some other error 1
+After above Pods have been removed from the Node, the following Pods will be evicted: pod-7-eviction-later, pod-8-eviction-later`,
 							},
 						},
 					},
 					Deletion: &clusterv1.MachineDeletionStatus{
-						NodeDrainStartTime: &metav1.Time{Time: time.Now().Add(-31 * time.Minute)},
+						NodeDrainStartTime: &metav1.Time{Time: time.Now().Add(-6 * time.Minute)},
 					},
 				},
 			},
@@ -1551,16 +1733,17 @@ func TestCalculateDeletingConditionForSummary(t *testing.T) {
 					Type:    clusterv1.MachineDeletingV1Beta2Condition,
 					Status:  metav1.ConditionTrue,
 					Reason:  clusterv1.MachineDeletingV1Beta2Reason,
-					Message: "Machine deletion in progress, stage: DrainingNode (since more than 30m)",
+					Message: "Machine deletion in progress since more than 15m, stage: DrainingNode, delay likely due to PodDisruptionBudgets, Pods not terminating, Pod eviction errors",
 				},
 			},
 		},
 		{
-			name: "Deleting condition with WaitingForVolumeDetach since more than 30m",
+			name: "Deleting condition with WaitingForVolumeDetach since more than 15m",
 			machine: &clusterv1.Machine{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "machine-test",
-					Namespace: metav1.NamespaceDefault,
+					Name:              "machine-test",
+					Namespace:         metav1.NamespaceDefault,
+					DeletionTimestamp: &metav1.Time{Time: time.Now().Add(-16 * time.Minute)},
 				},
 				Status: clusterv1.MachineStatus{
 					V1Beta2: &clusterv1.MachineV1Beta2Status{
@@ -1574,7 +1757,7 @@ func TestCalculateDeletingConditionForSummary(t *testing.T) {
 						},
 					},
 					Deletion: &clusterv1.MachineDeletionStatus{
-						WaitForNodeVolumeDetachStartTime: &metav1.Time{Time: time.Now().Add(-31 * time.Minute)},
+						WaitForNodeVolumeDetachStartTime: &metav1.Time{Time: time.Now().Add(-6 * time.Minute)},
 					},
 				},
 			},
@@ -1587,7 +1770,7 @@ func TestCalculateDeletingConditionForSummary(t *testing.T) {
 					Type:    clusterv1.MachineDeletingV1Beta2Condition,
 					Status:  metav1.ConditionTrue,
 					Reason:  clusterv1.MachineDeletingV1Beta2Reason,
-					Message: "Machine deletion in progress, stage: WaitingForVolumeDetach (since more than 30m)",
+					Message: "Machine deletion in progress since more than 15m, stage: WaitingForVolumeDetach",
 				},
 			},
 		},
@@ -1757,12 +1940,14 @@ func TestReconcileMachinePhases(t *testing.T) {
 					APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericBootstrapConfig",
 					Name:       "bootstrap-config1",
+					Namespace:  metav1.NamespaceDefault,
 				},
 			},
 			InfrastructureRef: corev1.ObjectReference{
 				APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 				Kind:       "GenericInfrastructureMachine",
 				Name:       "infra-config1",
+				Namespace:  metav1.NamespaceDefault,
 			},
 		},
 	}
@@ -1811,6 +1996,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		infraMachine.SetNamespace(ns.Name)
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		g.Expect(env.Create(ctx, cluster)).To(Succeed())
 		defaultKubeconfigSecret = kubeconfig.GenerateSecret(cluster, kubeconfig.FromEnvTestConfig(env.Config, cluster))
@@ -1863,6 +2050,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		infraMachine.SetNamespace(ns.Name)
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		g.Expect(env.Create(ctx, cluster)).To(Succeed())
 		defaultKubeconfigSecret = kubeconfig.GenerateSecret(cluster, kubeconfig.FromEnvTestConfig(env.Config, cluster))
@@ -1906,6 +2095,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		infraMachine.SetNamespace(ns.Name)
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		g.Expect(env.Create(ctx, cluster)).To(Succeed())
 		defaultKubeconfigSecret = kubeconfig.GenerateSecret(cluster, kubeconfig.FromEnvTestConfig(env.Config, cluster))
@@ -1966,6 +2157,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		g.Expect(unstructured.SetNestedField(infraMachine.Object, "us-east-2a", "spec", "failureDomain")).To(Succeed())
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		// Create Node.
 		node := &corev1.Node{
@@ -2055,6 +2248,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		g.Expect(unstructured.SetNestedField(infraMachine.Object, nodeProviderID, "spec", "providerID")).To(Succeed())
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		// Create Node.
 		node := &corev1.Node{
@@ -2133,6 +2328,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		g.Expect(unstructured.SetNestedField(infraMachine.Object, nodeProviderID, "spec", "providerID")).To(Succeed())
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		// Create Node.
 		node := &corev1.Node{
@@ -2210,6 +2407,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		g.Expect(unstructured.SetNestedField(infraMachine.Object, nodeProviderID, "spec", "providerID")).To(Succeed())
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 		// Set Machine ProviderID.
 		machine.Spec.ProviderID = ptr.To(nodeProviderID)
 
@@ -2272,6 +2471,8 @@ func TestReconcileMachinePhases(t *testing.T) {
 		g.Expect(unstructured.SetNestedField(infraMachine.Object, nodeProviderID, "spec", "providerID")).To(Succeed())
 		machine := defaultMachine.DeepCopy()
 		machine.Namespace = ns.Name
+		machine.Spec.InfrastructureRef.Namespace = ns.Name
+		machine.Spec.Bootstrap.ConfigRef.Namespace = ns.Name
 
 		// Create Node.
 		node := &corev1.Node{

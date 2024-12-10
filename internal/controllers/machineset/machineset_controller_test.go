@@ -106,12 +106,14 @@ func TestMachineSetReconciler(t *testing.T) {
 						APIVersion: "bootstrap.cluster.x-k8s.io/v1beta1",
 						Kind:       "GenericBootstrapConfigTemplate",
 						Name:       "ms-template",
+						Namespace:  namespace.Name,
 					},
 				},
 				InfrastructureRef: corev1.ObjectReference{
 					APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 					Kind:       "GenericInfrastructureMachineTemplate",
 					Name:       "ms-template",
+					Namespace:  namespace.Name,
 				},
 				NodeDrainTimeout:        duration10m,
 				NodeDeletionTimeout:     duration10m,
@@ -224,7 +226,7 @@ func TestMachineSetReconciler(t *testing.T) {
 
 		t.Log("Verifying the linked bootstrap template has a cluster owner reference")
 		g.Eventually(func() bool {
-			obj, err := external.Get(ctx, env, instance.Spec.Template.Spec.Bootstrap.ConfigRef, instance.Namespace)
+			obj, err := external.Get(ctx, env, instance.Spec.Template.Spec.Bootstrap.ConfigRef)
 			if err != nil {
 				return false
 			}
@@ -239,7 +241,7 @@ func TestMachineSetReconciler(t *testing.T) {
 
 		t.Log("Verifying the linked infrastructure template has a cluster owner reference")
 		g.Eventually(func() bool {
-			obj, err := external.Get(ctx, env, &instance.Spec.Template.Spec.InfrastructureRef, instance.Namespace)
+			obj, err := external.Get(ctx, env, &instance.Spec.Template.Spec.InfrastructureRef)
 			if err != nil {
 				return false
 			}
@@ -1731,7 +1733,7 @@ func TestMachineSetReconciler_reconcileUnhealthyMachines(t *testing.T) {
 			Type:    clusterv1.MachineOwnerRemediatedV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
 			Reason:  clusterv1.MachineSetMachineRemediationDeferredV1Beta2Reason,
-			Message: "GenericControlPlane default/cp1 is upgrading (\"ControlPlaneIsStable\" preflight check failed)",
+			Message: "* GenericControlPlane default/cp1 is upgrading (\"ControlPlaneIsStable\" preflight check failed)",
 		}, v1beta2conditions.IgnoreLastTransitionTime(true)))
 
 		// Verify the healthy machine is not deleted and does not have the OwnerRemediated condition.
@@ -2657,7 +2659,7 @@ func TestNewMachineUpToDateCondition(t *testing.T) {
 				Type:    clusterv1.MachineUpToDateV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-				Message: "Version v1.30.0, v1.31.0 required",
+				Message: "* Version v1.30.0, v1.31.0 required",
 			},
 		},
 		{
@@ -2718,7 +2720,7 @@ func TestNewMachineUpToDateCondition(t *testing.T) {
 				Type:    clusterv1.MachineUpToDateV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  clusterv1.MachineNotUpToDateV1Beta2Reason,
-				Message: "MachineDeployment spec.rolloutAfter expired",
+				Message: "* MachineDeployment spec.rolloutAfter expired",
 			},
 		},
 		{
@@ -2749,6 +2751,38 @@ func TestNewMachineUpToDateCondition(t *testing.T) {
 				Type:   clusterv1.MachineUpToDateV1Beta2Condition,
 				Status: metav1.ConditionTrue,
 				Reason: clusterv1.MachineUpToDateV1Beta2Reason,
+			},
+		},
+		{
+			name: "not up-to-date, version changed, rollout After expired",
+			machineDeployment: &clusterv1.MachineDeployment{
+				Spec: clusterv1.MachineDeploymentSpec{
+					RolloutAfter: &metav1.Time{Time: reconciliationTime.Add(-1 * time.Hour)}, // rollout after expired
+					Template: clusterv1.MachineTemplateSpec{
+						Spec: clusterv1.MachineSpec{
+							Version: ptr.To("v1.30.0"),
+						},
+					},
+				},
+			},
+			machineSet: &clusterv1.MachineSet{
+				ObjectMeta: metav1.ObjectMeta{
+					CreationTimestamp: metav1.Time{Time: reconciliationTime.Add(-2 * time.Hour)}, // MS created before rollout after
+				},
+				Spec: clusterv1.MachineSetSpec{
+					Template: clusterv1.MachineTemplateSpec{
+						Spec: clusterv1.MachineSpec{
+							Version: ptr.To("v1.31.0"),
+						},
+					},
+				},
+			},
+			expectCondition: &metav1.Condition{
+				Type:   clusterv1.MachineUpToDateV1Beta2Condition,
+				Status: metav1.ConditionFalse,
+				Reason: clusterv1.MachineNotUpToDateV1Beta2Reason,
+				Message: "* Version v1.31.0, v1.30.0 required\n" +
+					"* MachineDeployment spec.rolloutAfter expired",
 			},
 		},
 	}
