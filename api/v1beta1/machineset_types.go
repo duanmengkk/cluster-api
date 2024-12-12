@@ -90,6 +90,7 @@ type MachineSetSpec struct {
 // MachineSet's ScalingUp condition and corresponding reasons that will be used in v1Beta2 API version.
 const (
 	// MachineSetScalingUpV1Beta2Condition is true if actual replicas < desired replicas.
+	// Note: In case a MachineSet preflight check is preventing scale up, this will surface in the condition message.
 	MachineSetScalingUpV1Beta2Condition = ScalingUpV1Beta2Condition
 
 	// MachineSetScalingUpV1Beta2Reason surfaces when actual replicas < desired replicas.
@@ -153,6 +154,7 @@ const (
 // Note: Reason's could also be derived from the aggregation of machine's MachinesUpToDate conditions.
 const (
 	// MachineSetMachinesUpToDateV1Beta2Condition surfaces details of controlled machines not up to date, if any.
+	// Note: New machines are considered 10s after machine creation. This gives time to the machine's owner controller to recognize the new machine and add the UpToDate condition.
 	MachineSetMachinesUpToDateV1Beta2Condition = MachinesUpToDateV1Beta2Condition
 
 	// MachineSetMachinesUpToDateV1Beta2Reason surfaces when all the controlled machine's UpToDate conditions are true.
@@ -284,6 +286,9 @@ type MachineSetStatus struct {
 	Replicas int32 `json:"replicas"`
 
 	// The number of replicas that have labels matching the labels of the machine template of the MachineSet.
+	//
+	// Deprecated: This field is deprecated and is going to be removed in the next apiVersion. Please see https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md for more details.
+	//
 	// +optional
 	FullyLabeledReplicas int32 `json:"fullyLabeledReplicas"`
 

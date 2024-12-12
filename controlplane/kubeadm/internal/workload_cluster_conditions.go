@@ -47,8 +47,41 @@ import (
 // This operation is best effort, in the sense that in case of problems in retrieving member status, it sets
 // the condition to Unknown state without returning any error.
 func (w *Workload) UpdateEtcdConditions(ctx context.Context, controlPlane *ControlPlane) {
+	shouldRetry := func() bool {
+		// if CP is scaling up or down.
+		if ptr.Deref(controlPlane.KCP.Spec.Replicas, 0) != int32(len(controlPlane.Machines)) {
+			return true
+		}
+		// if CP machines are provisioning or deleting.
+		for _, m := range controlPlane.Machines {
+			if m.Status.NodeRef == nil {
+				return true
+			}
+			if !m.DeletionTimestamp.IsZero() {
+				return true
+			}
+		}
+		return false
+	}
+
 	if controlPlane.IsEtcdManaged() {
-		w.updateManagedEtcdConditions(ctx, controlPlane)
+		// Update etcd conditions.
+		// In case of well known temporary errors + control plane scaling up/down or rolling out, retry a few times.
+		// Note: it seems that reducing the number of them during every reconciles also improves stability,
+		// thus we are stopping doing retries (we only try once).
+		// However, we keep the code implementing retry support so we can easily revert this decision in a patch
+		// release if we need to.
+		maxRetry := 1
+		for i := range maxRetry {
+			retryableError := w.updateManagedEtcdConditions(ctx, controlPlane)
+			// if we should retry and there is a retry left, wait a bit.
+			if !retryableError || !shouldRetry() {
+				break
+			}
+			if i < maxRetry-1 {
+				time.Sleep(time.Duration(250*(i+1)) * time.Millisecond)
+			}
+		}
 		return
 	}
 	w.updateExternalEtcdConditions(ctx, controlPlane)
@@ -64,7 +97,7 @@ func (w *Workload) updateExternalEtcdConditions(_ context.Context, controlPlane 
 	// As soon as the v1beta1 condition above will be removed, we should drop this func entirely.
 }
 
-func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane *ControlPlane) {
+func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane *ControlPlane) (retryableError bool) {
 	// NOTE: This methods uses control plane nodes only to get in contact with etcd but then it relies on etcd
 	// as ultimate source of truth for the list of members and for their health.
 	controlPlaneNodes, err := w.getControlPlaneNodes(ctx)
@@ -88,7 +121,7 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 			Reason:  controlplanev1.KubeadmControlPlaneEtcdClusterInspectionFailedV1Beta2Reason,
 			Message: "Failed to get Nodes hosting the etcd cluster",
 		})
-		return
+		return retryableError
 	}
 
 	// Update conditions for etcd members on the nodes.
@@ -154,6 +187,9 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 		if err != nil {
 			// Note. even if we fail reading the member list from one node/etcd members we do not set EtcdMembersAgreeOnMemberList and EtcdMembersAgreeOnClusterID to false
 			// (those info are computed on what we can collect during inspection, so we can reason about availability even if there is a certain degree of problems in the cluster).
+
+			// While scaling up/down or rolling out new CP machines this error might happen.
+			retryableError = true
 			continue
 		}
 
@@ -176,6 +212,9 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 				Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberNotHealthyV1Beta2Reason,
 				Message: fmt.Sprintf("The etcd member hosted on this Machine reports the cluster is composed by %s, but all previously seen etcd members are reporting %s", etcdutil.MemberNames(currentMembers), etcdutil.MemberNames(controlPlane.EtcdMembers)),
 			})
+
+			// While scaling up/down or rolling out new CP machines this error might happen because we are reading the list from different nodes at different time.
+			retryableError = true
 			continue
 		}
 
@@ -277,6 +316,18 @@ func (w *Workload) updateManagedEtcdConditions(ctx context.Context, controlPlane
 		trueReason:        controlplanev1.KubeadmControlPlaneEtcdClusterHealthyV1Beta2Reason,
 		note:              "etcd member",
 	})
+	return retryableError
+}
+
+func unwrapAll(err error) error {
+	for {
+		newErr := errors.Unwrap(err)
+		if newErr == nil {
+			break
+		}
+		err = newErr
+	}
+	return err
 }
 
 func (w *Workload) getCurrentEtcdMembers(ctx context.Context, machine *clusterv1.Machine, nodeName string) ([]*etcd.Member, error) {
@@ -289,7 +340,7 @@ func (w *Workload) getCurrentEtcdMembers(ctx context.Context, machine *clusterv1
 			Type:    controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition,
 			Status:  metav1.ConditionUnknown,
 			Reason:  controlplanev1.KubeadmControlPlaneMachineEtcdMemberInspectionFailedV1Beta2Reason,
-			Message: fmt.Sprintf("Failed to connect to the etcd Pod on the %s Node: %s", nodeName, err),
+			Message: fmt.Sprintf("Failed to connect to the etcd Pod on the %s Node: %s", nodeName, unwrapAll(err)),
 		})
 		return nil, errors.Wrapf(err, "failed to get current etcd members: failed to connect to the etcd Pod on the %s Node", nodeName)
 	}
@@ -655,7 +706,7 @@ func (w *Workload) updateStaticPodCondition(ctx context.Context, machine *cluste
 				Type:    staticPodV1beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  controlplanev1.KubeadmControlPlaneMachinePodDoesNotExistV1Beta2Reason,
-				Message: fmt.Sprintf("Pod %s does not exist", podKey.Name),
+				Message: "Pod does not exist",
 			})
 			return
 		}
@@ -961,8 +1012,12 @@ func aggregateV1Beta2ConditionsFromMachinesToKCP(input aggregateV1Beta2Condition
 	for i := range input.controlPlane.Machines {
 		machine := input.controlPlane.Machines[i]
 		machineMessages := []string{}
+		conditionCount := 0
+		conditionMessages := sets.Set[string]{}
 		for _, condition := range input.machineConditions {
 			if machineCondition := v1beta2conditions.Get(machine, condition); machineCondition != nil {
+				conditionCount++
+				conditionMessages.Insert(machineCondition.Message)
 				switch machineCondition.Status {
 				case metav1.ConditionTrue:
 					kcpMachinesWithInfo.Insert(machine.Name)
@@ -974,6 +1029,15 @@ func aggregateV1Beta2ConditionsFromMachinesToKCP(input aggregateV1Beta2Condition
 					}
 					machineMessages = append(machineMessages, fmt.Sprintf("  * %s: %s", machineCondition.Type, m))
 				case metav1.ConditionUnknown:
+					// Ignore unknown when the machine doesn't have a provider ID yet (which also implies infrastructure not ready).
+					// Note: this avoids some noise when a new machine is provisioning; it is not possible to delay further
+					// because the etcd member might join the cluster / control plane components might start even before
+					// kubelet registers the node to the API server (e.g. in case kubelet has issues to register itself).
+					if machine.Spec.ProviderID == nil {
+						kcpMachinesWithInfo.Insert(machine.Name)
+						break
+					}
+
 					kcpMachinesWithUnknown.Insert(machine.Name)
 					m := machineCondition.Message
 					if m == "" {
@@ -985,6 +1049,12 @@ func aggregateV1Beta2ConditionsFromMachinesToKCP(input aggregateV1Beta2Condition
 		}
 
 		if len(machineMessages) > 0 {
+			if conditionCount > 1 && len(conditionMessages) == 1 {
+				message := fmt.Sprintf("  * Control plane components: %s", conditionMessages.UnsortedList()[0])
+				messageMap[message] = append(messageMap[message], machine.Name)
+				continue
+			}
+
 			message := strings.Join(machineMessages, "\n")
 			messageMap[message] = append(messageMap[message], machine.Name)
 		}

@@ -376,7 +376,7 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 		assertMachinesNotHealthy(g, mhc, 0)
 	})
 
-	t.Run("it marks unhealthy machines for remediation when there is one unhealthy Machine", func(t *testing.T) {
+	t.Run("it marks unhealthy machines for remediation when there is one unhealthy Machine and skips deleting machines", func(t *testing.T) {
 		g := NewWithT(t)
 		cluster := createCluster(g, ns.Name)
 
@@ -404,7 +404,28 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 			machineLabels(mhc.Spec.Selector.MatchLabels),
 		)
 		defer cleanup2()
-		machines = append(machines, unhealthyMachines...)
+		// Unhealthy nodes and machines but already in deletion.
+		// Note: deletionTimestamp gets set by deletion below which also removes the skip remediation annotation.
+		_, unhealthyMachinesDeleting, cleanup3 := createMachinesWithNodes(g, cluster,
+			count(1),
+			createNodeRefForMachine(true),
+			nodeStatus(corev1.ConditionUnknown),
+			machineLabels(mhc.Spec.Selector.MatchLabels),
+			machineFinalizers("test.cluster.io/delete-protection"),
+			machineAnnotations(map[string]string{clusterv1.MachineSkipRemediationAnnotation: ""}),
+		)
+		defer cleanup3()
+		// Mark machines for deletion and drop skip remediation annotation
+		// Note: without the skip remediation annotation the MHC controller might already reconcile the condition leading to a flaky test.
+		for _, m := range unhealthyMachinesDeleting {
+			g.Expect(env.Delete(ctx, m)).To(Succeed())
+			g.Expect(env.Get(ctx, client.ObjectKeyFromObject(m), m)).To(Succeed())
+			deletingMachinePatchHelper, err := patch.NewHelper(m, env.GetClient())
+			g.Expect(err).ToNot(HaveOccurred())
+			m.Annotations = map[string]string{}
+			g.Expect(deletingMachinePatchHelper.Patch(ctx, m)).To(Succeed())
+		}
+		machines = append(append(machines, unhealthyMachines...), unhealthyMachinesDeleting...)
 		targetMachines := make([]string, len(machines))
 		for i, m := range machines {
 			targetMachines[i] = m.Name
@@ -419,7 +440,7 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 			}
 			return &mhc.Status
 		}).Should(MatchMachineHealthCheckStatus(&clusterv1.MachineHealthCheckStatus{
-			ExpectedMachines:    3,
+			ExpectedMachines:    4,
 			CurrentHealthy:      2,
 			RemediationsAllowed: 2,
 			ObservedGeneration:  1,
@@ -441,7 +462,7 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 			},
 		}))
 
-		assertMachinesNotHealthy(g, mhc, 1)
+		assertMachinesNotHealthy(g, mhc, 2)
 		assertMachinesOwnerRemediated(g, mhc, 1)
 	})
 
@@ -1328,6 +1349,7 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 							APIVersion: "infrastructure.cluster.x-k8s.io/v1beta1",
 							Kind:       "GenericInfrastructureMachineTemplate",
 							Name:       infraTmpl.GetName(),
+							Namespace:  mhc.Namespace,
 						},
 					},
 				},
@@ -1536,6 +1558,7 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 			APIVersion: builder.RemediationGroupVersion.String(),
 			Kind:       "GenericExternalRemediationTemplate",
 			Name:       infraRemediationTmpl.GetName(),
+			Namespace:  cluster.Namespace,
 		}
 
 		mhc := newMachineHealthCheck(cluster.Namespace, cluster.Name)
@@ -1690,6 +1713,7 @@ func TestMachineHealthCheck_Reconcile(t *testing.T) {
 			APIVersion: builder.RemediationGroupVersion.String(),
 			Kind:       "GenericExternalRemediationTemplate",
 			Name:       infraRemediationTmpl.GetName(),
+			Namespace:  ns.Name,
 		}
 
 		mhc := newMachineHealthCheck(cluster.Namespace, cluster.Name)
@@ -2444,9 +2468,11 @@ type machinesWithNodes struct {
 	nodeStatus                 corev1.ConditionStatus
 	createNodeRefForMachine    bool
 	firstMachineAsControlPlane bool
+	annotations                map[string]string
 	labels                     map[string]string
 	failureReason              string
 	failureMessage             string
+	finalizers                 []string
 }
 
 type machineWithNodesOption func(m *machinesWithNodes)
@@ -2493,6 +2519,18 @@ func machineFailureMessage(s string) machineWithNodesOption {
 	}
 }
 
+func machineAnnotations(a map[string]string) machineWithNodesOption {
+	return func(m *machinesWithNodes) {
+		m.annotations = a
+	}
+}
+
+func machineFinalizers(f ...string) machineWithNodesOption {
+	return func(m *machinesWithNodes) {
+		m.finalizers = append(m.finalizers, f...)
+	}
+}
+
 func createMachinesWithNodes(
 	g *WithT,
 	c *clusterv1.Cluster,
@@ -2530,6 +2568,13 @@ func createMachinesWithNodes(
 			APIVersion: infraMachine.GetAPIVersion(),
 			Kind:       infraMachine.GetKind(),
 			Name:       infraMachine.GetName(),
+			Namespace:  infraMachine.GetNamespace(),
+		}
+		if len(o.finalizers) > 0 {
+			machine.Finalizers = o.finalizers
+		}
+		if o.annotations != nil {
+			machine.ObjectMeta.Annotations = o.annotations
 		}
 		g.Expect(env.Create(ctx, machine)).To(Succeed())
 		fmt.Printf("machine created: %s\n", machine.GetName())
@@ -2614,7 +2659,16 @@ func createMachinesWithNodes(
 			}
 		}
 		for _, m := range machines {
-			g.Expect(env.Delete(ctx, m)).To(Succeed())
+			if m.DeletionTimestamp.IsZero() {
+				g.Expect(env.Delete(ctx, m)).To(Succeed())
+			}
+			if len(m.Finalizers) > 1 {
+				g.Expect(env.Get(ctx, util.ObjectKey(m), m)).To(Succeed())
+				machinePatchHelper, err := patch.NewHelper(m, env.Client)
+				g.Expect(err).ToNot(HaveOccurred())
+				m.Finalizers = nil
+				g.Expect(machinePatchHelper.Patch(ctx, m)).To(Succeed())
+			}
 		}
 		for _, im := range infraMachines {
 			if err := env.Delete(ctx, im); !apierrors.IsNotFound(err) {

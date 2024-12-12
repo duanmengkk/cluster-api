@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -50,7 +51,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, s *scope) {
 		_, isMachinePoolMachine := machine.Labels[clusterv1.MachinePoolNameLabel]
 		return isMachinePoolMachine
 	}
-	allMachines := s.descendants.allMachines.Filter(collections.Not(isMachinePoolMachine))
+	controlPlaneMachines := s.descendants.controlPlaneMachines
 	workerMachines := s.descendants.workerMachines.Filter(collections.Not(isMachinePoolMachine))
 	machinesToBeRemediated := s.descendants.machinesToBeRemediated.Filter(collections.Not(isMachinePoolMachine))
 	unhealthyMachines := s.descendants.unhealthyMachines.Filter(collections.Not(isMachinePoolMachine))
@@ -64,8 +65,11 @@ func (r *Reconciler) updateStatus(ctx context.Context, s *scope) {
 	setControlPlaneAvailableCondition(ctx, s.cluster, s.controlPlane, s.controlPlaneIsNotFound)
 	setControlPlaneInitializedCondition(ctx, s.cluster, s.controlPlane, s.descendants.controlPlaneMachines, s.infraClusterIsNotFound, s.getDescendantsSucceeded)
 	setWorkersAvailableCondition(ctx, s.cluster, expv1.MachinePoolList{}, s.descendants.machineDeployments, s.getDescendantsSucceeded)
-	setMachinesReadyCondition(ctx, s.cluster, allMachines, s.getDescendantsSucceeded)
-	setMachinesUpToDateCondition(ctx, s.cluster, allMachines, s.getDescendantsSucceeded)
+	setControlPlaneMachinesReadyCondition(ctx, s.cluster, controlPlaneMachines, s.getDescendantsSucceeded)
+	setWorkerMachinesReadyCondition(ctx, s.cluster, workerMachines, s.getDescendantsSucceeded)
+	setControlPlaneMachinesUpToDateCondition(ctx, s.cluster, controlPlaneMachines, s.getDescendantsSucceeded)
+	setWorkerMachinesUpToDateCondition(ctx, s.cluster, workerMachines, s.getDescendantsSucceeded)
+	setRollingOutCondition(ctx, s.cluster, s.controlPlane, expv1.MachinePoolList{}, s.descendants.machineDeployments, s.controlPlaneIsNotFound, s.getDescendantsSucceeded)
 	setScalingUpCondition(ctx, s.cluster, s.controlPlane, expv1.MachinePoolList{}, s.descendants.machineDeployments, s.descendants.machineSets, s.controlPlaneIsNotFound, s.getDescendantsSucceeded)
 	setScalingDownCondition(ctx, s.cluster, s.controlPlane, expv1.MachinePoolList{}, s.descendants.machineDeployments, s.descendants.machineSets, s.controlPlaneIsNotFound, s.getDescendantsSucceeded)
 	setRemediatingCondition(ctx, s.cluster, machinesToBeRemediated, unhealthyMachines, s.getDescendantsSucceeded)
@@ -507,7 +511,7 @@ func setControlPlaneInitializedCondition(ctx context.Context, cluster *clusterv1
 			Type:    clusterv1.ClusterControlPlaneInitializedV1Beta2Condition,
 			Status:  metav1.ConditionFalse,
 			Reason:  clusterv1.ClusterControlPlaneNotInitializedV1Beta2Reason,
-			Message: fmt.Sprintf("Waiting for the %s to have status.initialized set to true", cluster.Spec.ControlPlaneRef.Kind),
+			Message: "Control plane not yet initialized",
 		})
 		return
 	}
@@ -601,15 +605,87 @@ func setWorkersAvailableCondition(ctx context.Context, cluster *clusterv1.Cluste
 	v1beta2conditions.Set(cluster, *workersAvailableCondition)
 }
 
-func setMachinesReadyCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
+func setControlPlaneMachinesReadyCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
+	machinesConditionSetter{
+		condition:                   clusterv1.ClusterControlPlaneMachinesReadyV1Beta2Condition,
+		machineAggregationCondition: clusterv1.MachineReadyV1Beta2Condition,
+		internalErrorReason:         clusterv1.ClusterControlPlaneMachinesReadyInternalErrorV1Beta2Reason,
+		noReplicasReason:            clusterv1.ClusterControlPlaneMachinesReadyNoReplicasV1Beta2Reason,
+		issueReason:                 clusterv1.ClusterControlPlaneMachinesNotReadyV1Beta2Reason,
+		unknownReason:               clusterv1.ClusterControlPlaneMachinesReadyUnknownV1Beta2Reason,
+		infoReason:                  clusterv1.ClusterControlPlaneMachinesReadyV1Beta2Reason,
+	}.setMachinesCondition(ctx, cluster, machines, getDescendantsSucceeded)
+}
+
+func setWorkerMachinesReadyCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
+	machinesConditionSetter{
+		condition:                   clusterv1.ClusterWorkerMachinesReadyV1Beta2Condition,
+		machineAggregationCondition: clusterv1.MachineReadyV1Beta2Condition,
+		internalErrorReason:         clusterv1.ClusterWorkerMachinesReadyInternalErrorV1Beta2Reason,
+		noReplicasReason:            clusterv1.ClusterWorkerMachinesReadyNoReplicasV1Beta2Reason,
+		issueReason:                 clusterv1.ClusterWorkerMachinesNotReadyV1Beta2Reason,
+		unknownReason:               clusterv1.ClusterWorkerMachinesReadyUnknownV1Beta2Reason,
+		infoReason:                  clusterv1.ClusterWorkerMachinesReadyV1Beta2Reason,
+	}.setMachinesCondition(ctx, cluster, machines, getDescendantsSucceeded)
+}
+
+func setControlPlaneMachinesUpToDateCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
+	// Only consider Machines that have an UpToDate condition or are older than 10s.
+	// This is done to ensure the MachinesUpToDate condition doesn't flicker after a new Machine is created,
+	// because it can take a bit until the UpToDate condition is set on a new Machine.
+	machines = machines.Filter(func(machine *clusterv1.Machine) bool {
+		return v1beta2conditions.Has(machine, clusterv1.MachineUpToDateV1Beta2Condition) || time.Since(machine.CreationTimestamp.Time) > 10*time.Second
+	})
+
+	machinesConditionSetter{
+		condition:                   clusterv1.ClusterControlPlaneMachinesUpToDateV1Beta2Condition,
+		machineAggregationCondition: clusterv1.MachineUpToDateV1Beta2Condition,
+		internalErrorReason:         clusterv1.ClusterControlPlaneMachinesUpToDateInternalErrorV1Beta2Reason,
+		noReplicasReason:            clusterv1.ClusterControlPlaneMachinesUpToDateNoReplicasV1Beta2Reason,
+		issueReason:                 clusterv1.ClusterControlPlaneMachinesNotUpToDateV1Beta2Reason,
+		unknownReason:               clusterv1.ClusterControlPlaneMachinesUpToDateUnknownV1Beta2Reason,
+		infoReason:                  clusterv1.ClusterControlPlaneMachinesUpToDateV1Beta2Reason,
+	}.setMachinesCondition(ctx, cluster, machines, getDescendantsSucceeded)
+}
+
+func setWorkerMachinesUpToDateCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
+	// Only consider Machines that have an UpToDate condition or are older than 10s.
+	// This is done to ensure the MachinesUpToDate condition doesn't flicker after a new Machine is created,
+	// because it can take a bit until the UpToDate condition is set on a new Machine.
+	machines = machines.Filter(func(machine *clusterv1.Machine) bool {
+		return v1beta2conditions.Has(machine, clusterv1.MachineUpToDateV1Beta2Condition) || time.Since(machine.CreationTimestamp.Time) > 10*time.Second
+	})
+
+	machinesConditionSetter{
+		condition:                   clusterv1.ClusterWorkerMachinesUpToDateV1Beta2Condition,
+		machineAggregationCondition: clusterv1.MachineUpToDateV1Beta2Condition,
+		internalErrorReason:         clusterv1.ClusterWorkerMachinesUpToDateInternalErrorV1Beta2Reason,
+		noReplicasReason:            clusterv1.ClusterWorkerMachinesUpToDateNoReplicasV1Beta2Reason,
+		issueReason:                 clusterv1.ClusterWorkerMachinesNotUpToDateV1Beta2Reason,
+		unknownReason:               clusterv1.ClusterWorkerMachinesUpToDateUnknownV1Beta2Reason,
+		infoReason:                  clusterv1.ClusterWorkerMachinesUpToDateV1Beta2Reason,
+	}.setMachinesCondition(ctx, cluster, machines, getDescendantsSucceeded)
+}
+
+type machinesConditionSetter struct {
+	condition                   string
+	machineAggregationCondition string
+	internalErrorReason         string
+	noReplicasReason            string
+	issueReason                 string
+	unknownReason               string
+	infoReason                  string
+}
+
+func (s machinesConditionSetter) setMachinesCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// If there was some unexpected errors in listing descendants (this should never happen), surface it.
 	if !getDescendantsSucceeded {
 		v1beta2conditions.Set(cluster, metav1.Condition{
-			Type:    clusterv1.ClusterMachinesReadyV1Beta2Condition,
+			Type:    s.condition,
 			Status:  metav1.ConditionUnknown,
-			Reason:  clusterv1.ClusterMachinesReadyInternalErrorV1Beta2Reason,
+			Reason:  s.internalErrorReason,
 			Message: "Please check controller logs for errors",
 		})
 		return
@@ -617,89 +693,39 @@ func setMachinesReadyCondition(ctx context.Context, cluster *clusterv1.Cluster, 
 
 	if len(machines) == 0 {
 		v1beta2conditions.Set(cluster, metav1.Condition{
-			Type:   clusterv1.ClusterMachinesReadyV1Beta2Condition,
+			Type:   s.condition,
 			Status: metav1.ConditionTrue,
-			Reason: clusterv1.ClusterMachinesReadyNoReplicasV1Beta2Reason,
+			Reason: s.noReplicasReason,
 		})
 		return
 	}
 
-	readyCondition, err := v1beta2conditions.NewAggregateCondition(
-		machines.UnsortedList(), clusterv1.MachineReadyV1Beta2Condition,
-		v1beta2conditions.TargetConditionType(clusterv1.ClusterMachinesReadyV1Beta2Condition),
+	machinesCondition, err := v1beta2conditions.NewAggregateCondition(
+		machines.UnsortedList(), s.machineAggregationCondition,
+		v1beta2conditions.TargetConditionType(s.condition),
 		// Using a custom merge strategy to override reasons applied during merge
 		v1beta2conditions.CustomMergeStrategy{
 			MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
 				v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
-					clusterv1.ClusterMachinesNotReadyV1Beta2Reason,
-					clusterv1.ClusterMachinesReadyUnknownV1Beta2Reason,
-					clusterv1.ClusterMachinesReadyV1Beta2Reason,
+					s.issueReason,
+					s.unknownReason,
+					s.infoReason,
 				)),
 			),
 		},
 	)
 	if err != nil {
-		log.Error(err, "Failed to aggregate Machine's Ready conditions")
+		log.Error(err, fmt.Sprintf("Failed to aggregate Machine's %s conditions", s.condition))
 		v1beta2conditions.Set(cluster, metav1.Condition{
-			Type:    clusterv1.ClusterMachinesReadyV1Beta2Condition,
+			Type:    s.condition,
 			Status:  metav1.ConditionUnknown,
-			Reason:  clusterv1.ClusterMachinesReadyInternalErrorV1Beta2Reason,
+			Reason:  s.internalErrorReason,
 			Message: "Please check controller logs for errors",
 		})
 		return
 	}
 
-	v1beta2conditions.Set(cluster, *readyCondition)
-}
-
-func setMachinesUpToDateCondition(ctx context.Context, cluster *clusterv1.Cluster, machines collections.Machines, getDescendantsSucceeded bool) {
-	log := ctrl.LoggerFrom(ctx)
-	// If we got unexpected errors in listing the machines (this should never happen), surface them.
-	if !getDescendantsSucceeded {
-		v1beta2conditions.Set(cluster, metav1.Condition{
-			Type:    clusterv1.ClusterMachinesUpToDateV1Beta2Condition,
-			Status:  metav1.ConditionUnknown,
-			Reason:  clusterv1.ClusterMachinesUpToDateInternalErrorV1Beta2Reason,
-			Message: "Please check controller logs for errors",
-		})
-		return
-	}
-
-	if len(machines) == 0 {
-		v1beta2conditions.Set(cluster, metav1.Condition{
-			Type:   clusterv1.ClusterMachinesUpToDateV1Beta2Condition,
-			Status: metav1.ConditionTrue,
-			Reason: clusterv1.ClusterMachinesUpToDateNoReplicasV1Beta2Reason,
-		})
-		return
-	}
-
-	upToDateCondition, err := v1beta2conditions.NewAggregateCondition(
-		machines.UnsortedList(), clusterv1.MachineUpToDateV1Beta2Condition,
-		v1beta2conditions.TargetConditionType(clusterv1.ClusterMachinesUpToDateV1Beta2Condition),
-		// Using a custom merge strategy to override reasons applied during merge
-		v1beta2conditions.CustomMergeStrategy{
-			MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
-				v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
-					clusterv1.ClusterMachinesNotUpToDateV1Beta2Reason,
-					clusterv1.ClusterMachinesUpToDateUnknownV1Beta2Reason,
-					clusterv1.ClusterMachinesUpToDateV1Beta2Reason,
-				)),
-			),
-		},
-	)
-	if err != nil {
-		log.Error(err, "Failed to aggregate Machine's UpToDate conditions")
-		v1beta2conditions.Set(cluster, metav1.Condition{
-			Type:    clusterv1.ClusterMachinesUpToDateV1Beta2Condition,
-			Status:  metav1.ConditionUnknown,
-			Reason:  clusterv1.ClusterMachinesUpToDateInternalErrorV1Beta2Reason,
-			Message: "Please check controller logs for errors",
-		})
-		return
-	}
-
-	v1beta2conditions.Set(cluster, *upToDateCondition)
+	v1beta2conditions.Set(cluster, *machinesCondition)
 }
 
 func setRemediatingCondition(ctx context.Context, cluster *clusterv1.Cluster, machinesToBeRemediated, unhealthyMachines collections.Machines, getMachinesSucceeded bool) {
@@ -749,6 +775,77 @@ func setRemediatingCondition(ctx context.Context, cluster *clusterv1.Cluster, ma
 		Reason:  clusterv1.ClusterRemediatingV1Beta2Reason,
 		Message: remediatingCondition.Message,
 	})
+}
+
+func setRollingOutCondition(ctx context.Context, cluster *clusterv1.Cluster, controlPlane *unstructured.Unstructured, machinePools expv1.MachinePoolList, machineDeployments clusterv1.MachineDeploymentList, controlPlaneIsNotFound bool, getDescendantsSucceeded bool) {
+	log := ctrl.LoggerFrom(ctx)
+
+	// If there was some unexpected errors in getting control plane or listing descendants (this should never happen), surface it.
+	if (cluster.Spec.ControlPlaneRef != nil && controlPlane == nil && !controlPlaneIsNotFound) || !getDescendantsSucceeded {
+		v1beta2conditions.Set(cluster, metav1.Condition{
+			Type:    clusterv1.ClusterRollingOutV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.ClusterRollingOutInternalErrorV1Beta2Reason,
+			Message: "Please check controller logs for errors",
+		})
+		return
+	}
+
+	if controlPlane == nil && len(machinePools.Items)+len(machineDeployments.Items) == 0 {
+		v1beta2conditions.Set(cluster, metav1.Condition{
+			Type:   clusterv1.ClusterRollingOutV1Beta2Condition,
+			Status: metav1.ConditionFalse,
+			Reason: clusterv1.ClusterNotRollingOutV1Beta2Reason,
+		})
+		return
+	}
+
+	ws := make([]aggregationWrapper, 0, len(machinePools.Items)+len(machineDeployments.Items)+1)
+	if controlPlane != nil {
+		// control plane is considered only if it is reporting the condition (the contract does not require conditions to be reported)
+		// Note: this implies that it won't surface as "Conditions RollingOut not yet reported from ...".
+		if c, err := v1beta2conditions.UnstructuredGet(controlPlane, clusterv1.RollingOutV1Beta2Condition); err == nil && c != nil {
+			ws = append(ws, aggregationWrapper{cp: controlPlane})
+		}
+	}
+	for _, mp := range machinePools.Items {
+		ws = append(ws, aggregationWrapper{mp: &mp})
+	}
+	for _, md := range machineDeployments.Items {
+		ws = append(ws, aggregationWrapper{md: &md})
+	}
+
+	rollingOutCondition, err := v1beta2conditions.NewAggregateCondition(
+		ws, clusterv1.RollingOutV1Beta2Condition,
+		v1beta2conditions.TargetConditionType(clusterv1.ClusterRollingOutV1Beta2Condition),
+		// Instruct aggregate to consider RollingOut condition with negative polarity.
+		v1beta2conditions.NegativePolarityConditionTypes{clusterv1.RollingOutV1Beta2Condition},
+		// Using a custom merge strategy to override reasons applied during merge and to ensure merge
+		// takes into account the fact the RollingOut has negative polarity.
+		v1beta2conditions.CustomMergeStrategy{
+			MergeStrategy: v1beta2conditions.DefaultMergeStrategy(
+				v1beta2conditions.TargetConditionHasPositivePolarity(false),
+				v1beta2conditions.ComputeReasonFunc(v1beta2conditions.GetDefaultComputeMergeReasonFunc(
+					clusterv1.ClusterRollingOutV1Beta2Reason,
+					clusterv1.ClusterRollingOutUnknownV1Beta2Reason,
+					clusterv1.ClusterNotRollingOutV1Beta2Reason,
+				)),
+				v1beta2conditions.GetPriorityFunc(v1beta2conditions.GetDefaultMergePriorityFunc(clusterv1.RollingOutV1Beta2Condition)),
+			),
+		},
+	)
+	if err != nil {
+		log.Error(err, "Failed to aggregate ControlPlane, MachinePool, MachineDeployment, MachineSet's RollingOut conditions")
+		v1beta2conditions.Set(cluster, metav1.Condition{
+			Type:    clusterv1.ClusterRollingOutV1Beta2Condition,
+			Status:  metav1.ConditionUnknown,
+			Reason:  clusterv1.ClusterRollingOutInternalErrorV1Beta2Reason,
+			Message: "Please check controller logs for errors",
+		})
+		return
+	}
+
+	v1beta2conditions.Set(cluster, *rollingOutCondition)
 }
 
 func setScalingUpCondition(ctx context.Context, cluster *clusterv1.Cluster, controlPlane *unstructured.Unstructured, machinePools expv1.MachinePoolList, machineDeployments clusterv1.MachineDeploymentList, machineSets clusterv1.MachineSetList, controlPlaneIsNotFound bool, getDescendantsSucceeded bool) {
@@ -960,12 +1057,12 @@ func setAvailableCondition(ctx context.Context, cluster *clusterv1.Cluster) {
 	log := ctrl.LoggerFrom(ctx)
 
 	forConditionTypes := v1beta2conditions.ForConditionTypes{
+		clusterv1.ClusterDeletingV1Beta2Condition,
+		clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition,
 		clusterv1.ClusterInfrastructureReadyV1Beta2Condition,
 		clusterv1.ClusterControlPlaneAvailableV1Beta2Condition,
 		clusterv1.ClusterWorkersAvailableV1Beta2Condition,
-		clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition,
 		clusterv1.ClusterTopologyReconciledV1Beta2Condition,
-		clusterv1.ClusterDeletingV1Beta2Condition,
 	}
 	for _, g := range cluster.Spec.AvailabilityGates {
 		forConditionTypes = append(forConditionTypes, g.ConditionType)
