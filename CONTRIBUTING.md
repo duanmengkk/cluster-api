@@ -142,7 +142,7 @@ Cluster API maintains the most recent release/releases for all supported API and
 |---------------|--------------|------------------------------------------------|
 | v1.9.x        | **v1beta1**  | when v1.11.0 will be released                  |
 | v1.8.x        | **v1beta1**  | when v1.10.0 will be released                  |
-| v1.7.x        | **v1beta1**  | when v1.9.0 will be released                   |
+| v1.7.x        | **v1beta1**  | EOL since 2024-12-10 - v1.9.0 release date     |
 | v1.6.x        | **v1beta1**  | EOL since 2024-08-12 - v1.8.0 release date     |
 | v1.5.x        | **v1beta1**  | EOL since 2024-04-16 - v1.7.0 release date     |
 | v1.4.x        | **v1beta1**  | EOL since 2023-12-05 - v1.6.0 release date     |
@@ -313,7 +313,7 @@ The artifact folder contains:
     - Dump of the Cluster API resources (only if the cluster is a management cluster).
     - Machine logs (only if the cluster is a workload cluster)
 
-In case you want to run E2E test locally, please refer to the [Testing](https://cluster-api.sigs.k8s.io/developer/testing.html#running-unit-and-integration-tests) guide. An overview over our e2e test jobs (and also all our other jobs) can be found in [Jobs](https://cluster-api.sigs.k8s.io/reference/jobs.html).
+In case you want to run E2E test locally, please refer to the [Testing](https://cluster-api.sigs.k8s.io/developer/core/testing#running-unit-and-integration-tests) guide. All our e2e test jobs (and also all our other jobs) can be found in [k8s.io/test-infra](https://github.com/kubernetes/test-infra/tree/master/config/jobs/kubernetes-sigs/cluster-api).
 
 ## Reviewing a Patch
 

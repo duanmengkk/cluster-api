@@ -36,17 +36,15 @@ func init() {
 // and all the other conditions are sorted by Type.
 func defaultSortLessFunc(i, j metav1.Condition) bool {
 	fi, oki := orderMap[i.Type]
-	fj, okj := orderMap[j.Type]
-	switch {
-	case oki && !okj:
-		return true
-	case !oki && okj:
-		return false
-	case oki && okj:
-		return fi < fj
+	if !oki {
+		fi = orderMap[readinessAndAvailabilityGates]
 	}
-
-	return i.Type < j.Type
+	fj, okj := orderMap[j.Type]
+	if !okj {
+		fj = orderMap[readinessAndAvailabilityGates]
+	}
+	return fi < fj ||
+		(fi == fj && i.Type < j.Type)
 }
 
 // The order array below leads to the following condition ordering:
@@ -78,12 +76,19 @@ func defaultSortLessFunc(i, j metav1.Condition) bool {
 // | OwnerRemediated                |         |     |    |    |    | x       |
 // | -- Operations --               |         |     |    |    |    |         |
 // | TopologyReconciled             | x       |     |    |    |    |         |
+// | RollingOut                     | x       | x   | x  |    | x  |         |
 // | Remediating                    | x       | x   | x  | x  | x  |         |
 // | ScalingDown                    | x       | x   | x  | x  | x  |         |
 // | ScalingUp                      | x       | x   | x  | x  | x  |         |
 // | -- Aggregated from Machines -- |         |     |    |    |    |         |
-// | MachinesReady                  | x       | x   | x  | x  | x  |         |
-// | MachinesUpToDate               | x       | x   | x  | x  | x  |         |
+// | MachinesReady                  |         | x   | x  | x  | x  |         |
+// | ControlPlaneMachinesReady      | x       |     |    |    |    |         |
+// | WorkerMachinesReady            | x       |     |    |    |    |         |
+// | MachinesUpToDate               |         | x   | x  | x  | x  |         |
+// | ControlPlaneMachinesUpToDate   | x       |     |    |    |    |         |
+// | WorkerMachinesUpToDate         | x       |     |    |    |    |         |
+// | -- From other controllers --   |         |     |    |    |    |         |
+// | Readiness/Availability gates   | x       |     |    |    |    | x       |
 // | -- Misc --                     |         |     |    |    |    |         |
 // | Paused                         | x       | x   | x  | x  | x  | x       |
 // | Deleting                       | x       | x   | x  | x  | x  | x       |
@@ -112,14 +117,25 @@ var order = []string{
 	clusterv1.MachineHealthCheckSucceededV1Beta2Condition,
 	clusterv1.MachineOwnerRemediatedV1Beta2Condition,
 	clusterv1.ClusterTopologyReconciledV1Beta2Condition,
+	clusterv1.RollingOutV1Beta2Condition,
 	clusterv1.RemediatingV1Beta2Condition,
 	clusterv1.ScalingDownV1Beta2Condition,
 	clusterv1.ScalingUpV1Beta2Condition,
 	clusterv1.MachinesReadyV1Beta2Condition,
+	clusterv1.ClusterControlPlaneMachinesReadyV1Beta2Condition,
+	clusterv1.ClusterWorkerMachinesReadyV1Beta2Condition,
 	clusterv1.MachinesUpToDateV1Beta2Condition,
+	clusterv1.ClusterControlPlaneMachinesUpToDateV1Beta2Condition,
+	clusterv1.ClusterWorkerMachinesUpToDateV1Beta2Condition,
+	readinessAndAvailabilityGates,
 	clusterv1.PausedV1Beta2Condition,
 	clusterv1.DeletingV1Beta2Condition,
 }
+
+// Constants defining a placeholder for readiness and availability gates.
+const (
+	readinessAndAvailabilityGates = ""
+)
 
 // Constants inlined for ordering (we want to avoid importing the KCP API package).
 const (

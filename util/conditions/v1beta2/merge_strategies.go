@@ -19,6 +19,7 @@ package v1beta2
 import (
 	"fmt"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -70,8 +71,9 @@ type DefaultMergeStrategyOption interface {
 // DefaultMergeStrategyOptions allows to set options for the DefaultMergeStrategy behaviour.
 type DefaultMergeStrategyOptions struct {
 	getPriorityFunc                    func(condition metav1.Condition) MergePriority
-	computeReasonFunc                  func(issueConditions []ConditionWithOwnerInfo, unknownConditions []ConditionWithOwnerInfo, infoConditions []ConditionWithOwnerInfo) string
 	targetConditionHasPositivePolarity bool
+	computeReasonFunc                  func(issueConditions []ConditionWithOwnerInfo, unknownConditions []ConditionWithOwnerInfo, infoConditions []ConditionWithOwnerInfo) string
+	summaryMessageTransformFunc        func([]string) []string
 }
 
 // ApplyOptions applies the given list options on these options,
@@ -100,6 +102,7 @@ func DefaultMergeStrategy(opts ...DefaultMergeStrategyOption) MergeStrategy {
 		targetConditionHasPositivePolarity: true,
 		computeReasonFunc:                  GetDefaultComputeMergeReasonFunc(issuesReportedReason, unknownReportedReason, infoReportedReason), // NOTE: when no specific reason are provided, generic ones are used.
 		getPriorityFunc:                    GetDefaultMergePriorityFunc(),
+		summaryMessageTransformFunc:        nil,
 	}
 	strategyOpt.ApplyOptions(opts)
 
@@ -107,6 +110,7 @@ func DefaultMergeStrategy(opts ...DefaultMergeStrategyOption) MergeStrategy {
 		getPriorityFunc:                    strategyOpt.getPriorityFunc,
 		computeReasonFunc:                  strategyOpt.computeReasonFunc,
 		targetConditionHasPositivePolarity: strategyOpt.targetConditionHasPositivePolarity,
+		summaryMessageTransformFunc:        strategyOpt.summaryMessageTransformFunc,
 	}
 }
 
@@ -186,8 +190,9 @@ const (
 // defaultMergeStrategy defines the default merge strategy for Cluster API conditions.
 type defaultMergeStrategy struct {
 	getPriorityFunc                    func(condition metav1.Condition) MergePriority
-	computeReasonFunc                  func(issueConditions []ConditionWithOwnerInfo, unknownConditions []ConditionWithOwnerInfo, infoConditions []ConditionWithOwnerInfo) string
 	targetConditionHasPositivePolarity bool
+	computeReasonFunc                  func(issueConditions []ConditionWithOwnerInfo, unknownConditions []ConditionWithOwnerInfo, infoConditions []ConditionWithOwnerInfo) string
+	summaryMessageTransformFunc        func([]string) []string
 }
 
 // Merge all conditions in input based on a strategy that surfaces issues first, then unknown conditions, then info (if none of issues and unknown condition exists).
@@ -261,32 +266,7 @@ func (d *defaultMergeStrategy) Merge(conditions []ConditionWithOwnerInfo, condit
 	// When including messages from conditions, they are sorted by issue/unknown and by the implicit order of condition types
 	// provided by the user (it is considered as order of relevance).
 	if isSummaryOperation {
-		messages := []string{}
-
-		// Note: use conditions because we want to preserve the order of relevance defined by the users (the order of condition types).
-		for _, condition := range conditions {
-			priority := d.getPriorityFunc(condition.Condition)
-			if priority == InfoMergePriority {
-				// Drop info messages when we are surfacing issues or unknown.
-				if status != metav1.ConditionTrue {
-					continue
-				}
-				// Drop info conditions with empty messages.
-				if condition.Message == "" {
-					continue
-				}
-			}
-
-			m := fmt.Sprintf("* %s:", condition.Type)
-			if condition.Message != "" {
-				m += indentIfMultiline(condition.Message)
-			} else {
-				m += " No additional info provided"
-			}
-			messages = append(messages, m)
-		}
-
-		message = strings.Join(messages, "\n")
+		message = summaryMessage(conditions, d, status)
 	}
 
 	// When performing the aggregate operation, we are merging one single condition from potentially many objects.
@@ -369,12 +349,47 @@ func splitConditionsByPriority(conditions []ConditionWithOwnerInfo, getPriority 
 	return issueConditions, unknownConditions, infoConditions
 }
 
+// summaryMessage returns message for the summary operation.
+func summaryMessage(conditions []ConditionWithOwnerInfo, d *defaultMergeStrategy, status metav1.ConditionStatus) string {
+	messages := []string{}
+
+	// Note: use conditions because we want to preserve the order of relevance defined by the users (the order of condition types).
+	for _, condition := range conditions {
+		priority := d.getPriorityFunc(condition.Condition)
+		if priority == InfoMergePriority {
+			// Drop info messages when we are surfacing issues or unknown.
+			if status != metav1.ConditionTrue {
+				continue
+			}
+			// Drop info conditions with empty messages.
+			if condition.Message == "" {
+				continue
+			}
+		}
+
+		m := fmt.Sprintf("* %s:", condition.Type)
+		if condition.Message != "" {
+			m += indentIfMultiline(condition.Message)
+		} else {
+			m += fmt.Sprintf(" %s", condition.Reason)
+		}
+		messages = append(messages, m)
+	}
+
+	if d.summaryMessageTransformFunc != nil {
+		messages = d.summaryMessageTransformFunc(messages)
+	}
+
+	return strings.Join(messages, "\n")
+}
+
 // aggregateMessages returns messages for the aggregate operation.
 func aggregateMessages(conditions []ConditionWithOwnerInfo, n *int, dropEmpty bool, getPriority func(condition metav1.Condition) MergePriority, otherMessages map[MergePriority]string) (messages []string) {
 	// create a map with all the messages and the list of objects reporting the same message.
 	messageObjMap := map[string]map[string][]string{}
 	messagePriorityMap := map[string]MergePriority{}
 	messageMustGoFirst := map[string]bool{}
+	cpMachines := sets.Set[string]{}
 	for _, condition := range conditions {
 		if dropEmpty && condition.Message == "" {
 			continue
@@ -386,6 +401,11 @@ func aggregateMessages(conditions []ConditionWithOwnerInfo, n *int, dropEmpty bo
 			messageObjMap[condition.OwnerResource.Kind] = map[string][]string{}
 		}
 		messageObjMap[condition.OwnerResource.Kind][m] = append(messageObjMap[condition.OwnerResource.Kind][m], condition.OwnerResource.Name)
+
+		// Keep track of CP machines
+		if condition.OwnerResource.IsControlPlaneMachine {
+			cpMachines.Insert(condition.OwnerResource.Name)
+		}
 
 		// Keep track of the priority of the message.
 		// In case the same message exists with different priorities, the highest according to issue/unknown/info applies.
@@ -456,7 +476,9 @@ func aggregateMessages(conditions []ConditionWithOwnerInfo, n *int, dropEmpty bo
 
 			msg := ""
 			allObjects := messageObjMapForKind[m]
-			sort.Strings(allObjects)
+			sort.Slice(allObjects, func(i, j int) bool {
+				return sortObj(allObjects[i], allObjects[j], cpMachines)
+			})
 			switch {
 			case len(allObjects) == 0:
 				// This should never happen, entry in the map exists only when an object reports a message.
@@ -520,13 +542,47 @@ func sortMessage(i, j string, messageMustGoFirst map[string]bool, messagePriorit
 	return strings.Join(messageObjMapForKind[i], ",") < strings.Join(messageObjMapForKind[j], ",")
 }
 
+func sortObj(i, j string, cpMachines sets.Set[string]) bool {
+	if cpMachines.Has(i) && !cpMachines.Has(j) {
+		return true
+	}
+	if !cpMachines.Has(i) && cpMachines.Has(j) {
+		return false
+	}
+	return i < j
+}
+
+var re = regexp.MustCompile(`\s*\*\s+`)
+
 func indentIfMultiline(m string) string {
 	msg := ""
-	if strings.Contains(m, "\n") || strings.HasPrefix(m, "* ") {
+	// If it is a multiline string or if it start with a bullet, indent the message.
+	if strings.Contains(m, "\n") || re.MatchString(m) {
 		msg += "\n"
+
+		// Split the message in lines, and add a prefix; prefix can be
+		// "  " when indenting a line starting in a bullet
+		// "  * " when indenting a line starting without a bullet (indent + add a bullet)
+		// "    " when indenting a line starting with a bullet, but other lines required adding a bullet
 		lines := strings.Split(m, "\n")
+		prefix := "  "
+		hasLinesWithoutBullet := false
+		for i := range lines {
+			if !re.MatchString(lines[i]) {
+				hasLinesWithoutBullet = true
+				break
+			}
+		}
 		for i, l := range lines {
-			lines[i] = "  " + l
+			prefix := prefix
+			if hasLinesWithoutBullet {
+				if !re.MatchString(lines[i]) {
+					prefix += "* "
+				} else {
+					prefix += "  "
+				}
+			}
+			lines[i] = prefix + l
 		}
 		msg += strings.Join(lines, "\n")
 	} else {

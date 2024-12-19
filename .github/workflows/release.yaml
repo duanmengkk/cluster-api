@@ -22,7 +22,7 @@ jobs:
           fetch-depth: 0
       - name: Get changed files
         id: changed-files
-        uses: tj-actions/changed-files@4edd678ac3f81e2dc578756871e4d00c19191daf # tag=v45.0.4
+        uses: tj-actions/changed-files@bab30c2299617f6615ec02a68b9a40d10bd21366 # tag=v45.0.5
       - name: Get release version
         id: release-version
         run: |
@@ -94,7 +94,7 @@ jobs:
       - name: Calculate go version
         run: echo "go_version=$(make go-version)" >> $GITHUB_ENV
       - name: Set up Go
-        uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # tag=v5.1.0
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # tag=v5.2.0
         with:
           go-version: ${{ env.go_version }}
       - name: generate release artifacts
