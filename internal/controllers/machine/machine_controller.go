@@ -220,6 +220,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		return ctrl.Result{}, err
 	}
 
+	if !m.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Check reconcileDeleteCache to ensure we won't run reconcileDelete too frequently.
+		// Note: The reconcileDelete func will add entries to the cache.
+		if cacheEntry, ok := r.reconcileDeleteCache.Has(cache.NewReconcileEntryKey(m)); ok {
+			if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
+				return ctrl.Result{RequeueAfter: requeueAfter}, nil
+			}
+		}
+	}
+
 	s := &scope{
 		cluster: cluster,
 		machine: m,
@@ -418,13 +428,6 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	cluster := s.cluster
 	m := s.machine
 
-	// Check reconcileDeleteCache to ensure we won't run reconcileDelete too frequently.
-	if cacheEntry, ok := r.reconcileDeleteCache.Has(cache.NewReconcileEntryKey(s.machine)); ok {
-		if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
-			return ctrl.Result{RequeueAfter: requeueAfter}, nil
-		}
-	}
-
 	s.reconcileDeleteExecuted = true
 
 	// Add entry to the reconcileDeleteCache so we won't run reconcileDelete more than once per second.
@@ -560,6 +563,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 				hooks = append(hooks, key)
 			}
 		}
+		slices.Sort(hooks)
 		log.Info("Waiting for pre-terminate hooks to succeed", "hooks", strings.Join(hooks, ","))
 		conditions.MarkFalse(m, clusterv1.PreTerminateDeleteHookSucceededCondition, clusterv1.WaitingExternalHookReason, clusterv1.ConditionSeverityInfo, "")
 		s.deletingReason = clusterv1.MachineDeletingWaitingForPreTerminateHookV1Beta2Reason
@@ -630,7 +634,21 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	return ctrl.Result{}, nil
 }
 
+const (
+	// KubeadmControlPlaneAPIVersion inlined from KCP (we want to avoid importing the KCP API package).
+	KubeadmControlPlaneAPIVersion = "controlplane.cluster.x-k8s.io/v1beta1"
+
+	// KubeadmControlPlanePreTerminateHookCleanupAnnotation inlined from KCP (we want to avoid importing the KCP API package).
+	KubeadmControlPlanePreTerminateHookCleanupAnnotation = clusterv1.PreTerminateDeleteHookAnnotationPrefix + "/kcp-cleanup"
+)
+
 func (r *Reconciler) isNodeDrainAllowed(m *clusterv1.Machine) bool {
+	if util.IsControlPlaneMachine(m) && util.HasOwner(m.GetOwnerReferences(), KubeadmControlPlaneAPIVersion, []string{"KubeadmControlPlane"}) {
+		if _, exists := m.Annotations[KubeadmControlPlanePreTerminateHookCleanupAnnotation]; !exists {
+			return false
+		}
+	}
+
 	if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeNodeDrainingAnnotation]; exists {
 		return false
 	}
@@ -645,6 +663,12 @@ func (r *Reconciler) isNodeDrainAllowed(m *clusterv1.Machine) bool {
 // isNodeVolumeDetachingAllowed returns False if either ExcludeWaitForNodeVolumeDetachAnnotation annotation is set OR
 // nodeVolumeDetachTimeoutExceeded timeout is exceeded, otherwise returns True.
 func (r *Reconciler) isNodeVolumeDetachingAllowed(m *clusterv1.Machine) bool {
+	if util.IsControlPlaneMachine(m) && util.HasOwner(m.GetOwnerReferences(), KubeadmControlPlaneAPIVersion, []string{"KubeadmControlPlane"}) {
+		if _, exists := m.Annotations[KubeadmControlPlanePreTerminateHookCleanupAnnotation]; !exists {
+			return false
+		}
+	}
+
 	if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation]; exists {
 		return false
 	}
@@ -733,7 +757,7 @@ func (r *Reconciler) isDeleteNodeAllowed(ctx context.Context, cluster *clusterv1
 	// controlPlaneRef is an optional field in the Cluster so skip the external
 	// managed control plane check if it is nil
 	if cluster.Spec.ControlPlaneRef != nil {
-		controlPlane, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef, cluster.Spec.ControlPlaneRef.Namespace)
+		controlPlane, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef)
 		if apierrors.IsNotFound(err) {
 			// If control plane object in the reference does not exist, log and skip check for
 			// external managed control plane
