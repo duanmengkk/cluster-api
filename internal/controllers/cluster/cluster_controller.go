@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -103,14 +104,17 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.controlPlaneMachineToCluster),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		Watches(
 			&clusterv1.MachineDeployment{},
 			handler.EnqueueRequestsFromMapFunc(r.machineDeploymentToCluster),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		Watches(
 			&expv1.MachinePool{},
 			handler.EnqueueRequestsFromMapFunc(r.machinePoolToCluster),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
@@ -261,10 +265,13 @@ func patchCluster(ctx context.Context, patchHelper *patch.Helper, cluster *clust
 			clusterv1.ClusterInfrastructureReadyV1Beta2Condition,
 			clusterv1.ClusterControlPlaneAvailableV1Beta2Condition,
 			clusterv1.ClusterControlPlaneInitializedV1Beta2Condition,
+			clusterv1.ClusterControlPlaneMachinesReadyV1Beta2Condition,
+			clusterv1.ClusterControlPlaneMachinesUpToDateV1Beta2Condition,
 			clusterv1.ClusterWorkersAvailableV1Beta2Condition,
-			clusterv1.ClusterMachinesReadyV1Beta2Condition,
-			clusterv1.ClusterMachinesUpToDateV1Beta2Condition,
+			clusterv1.ClusterWorkerMachinesReadyV1Beta2Condition,
+			clusterv1.ClusterWorkerMachinesUpToDateV1Beta2Condition,
 			clusterv1.ClusterRemoteConnectionProbeV1Beta2Condition,
+			clusterv1.ClusterRollingOutV1Beta2Condition,
 			clusterv1.ClusterScalingUpV1Beta2Condition,
 			clusterv1.ClusterScalingDownV1Beta2Condition,
 			clusterv1.ClusterRemediatingV1Beta2Condition,

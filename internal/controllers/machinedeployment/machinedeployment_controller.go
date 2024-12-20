@@ -91,20 +91,22 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 
 	err = ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.MachineDeployment{}).
-		Owns(&clusterv1.MachineSet{}).
+		Owns(&clusterv1.MachineSet{}, builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog))).
 		// Watches enqueues MachineDeployment for corresponding MachineSet resources, if no managed controller reference (owner) exists.
 		Watches(
 			&clusterv1.MachineSet{},
 			handler.EnqueueRequestsFromMapFunc(r.MachineSetToDeployments),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog)),
 		).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
 		Watches(
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(clusterToMachineDeployments),
-			builder.WithPredicates(
+			builder.WithPredicates(predicates.All(mgr.GetScheme(), predicateLog,
+				predicates.ResourceIsChanged(mgr.GetScheme(), predicateLog),
 				predicates.ClusterPausedTransitions(mgr.GetScheme(), predicateLog),
-			),
+			)),
 			// TODO: should this wait for Cluster.Status.InfrastructureReady similar to Infra Machine resources?
 		).Complete(r)
 	if err != nil {
@@ -216,6 +218,7 @@ func patchMachineDeployment(ctx context.Context, patchHelper *patch.Helper, md *
 			clusterv1.MachineDeploymentAvailableV1Beta2Condition,
 			clusterv1.MachineDeploymentMachinesReadyV1Beta2Condition,
 			clusterv1.MachineDeploymentMachinesUpToDateV1Beta2Condition,
+			clusterv1.MachineDeploymentRollingOutV1Beta2Condition,
 			clusterv1.MachineDeploymentScalingDownV1Beta2Condition,
 			clusterv1.MachineDeploymentScalingUpV1Beta2Condition,
 			clusterv1.MachineDeploymentRemediatingV1Beta2Condition,
@@ -513,7 +516,13 @@ func reconcileExternalTemplateReference(ctx context.Context, c client.Client, cl
 		return errors.New(err.Error())
 	}
 
-	obj, err := external.Get(ctx, c, ref, cluster.Namespace)
+	// Ensure the ref namespace is populated for objects not yet defaulted by webhook
+	if ref.Namespace == "" {
+		ref = ref.DeepCopy()
+		ref.Namespace = cluster.Namespace
+	}
+
+	obj, err := external.Get(ctx, c, ref)
 	if err != nil {
 		return err
 	}

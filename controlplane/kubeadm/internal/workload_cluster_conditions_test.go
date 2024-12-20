@@ -43,12 +43,134 @@ import (
 )
 
 func TestUpdateEtcdConditions(t *testing.T) {
+	var callCount int
+	tests := []struct {
+		name                      string
+		kcp                       *controlplanev1.KubeadmControlPlane
+		machines                  []*clusterv1.Machine
+		injectClient              client.Client // This test is injecting a fake client because it is required to create nodes with a controlled Status or to fail with a specific error.
+		injectEtcdClientGenerator etcdClientFor // This test is injecting a fake etcdClientGenerator because it is required to nodes with a controlled Status or to fail with a specific error.
+		expectedRetry             bool
+	}{
+		{
+			name: "retry retryable errors when KCP is not stable (e.g. scaling up)",
+			kcp: &controlplanev1.KubeadmControlPlane{
+				Spec: controlplanev1.KubeadmControlPlaneSpec{
+					Replicas: ptr.To(int32(3)),
+				},
+			},
+			machines: []*clusterv1.Machine{
+				fakeMachine("m1", withNodeRef("n1")),
+			},
+			injectClient: &fakeClient{
+				list: &corev1.NodeList{
+					Items: []corev1.Node{*fakeNode("n1")},
+				},
+			},
+			injectEtcdClientGenerator: &fakeEtcdClientGenerator{
+				forNodesClientFunc: func(_ []string) (*etcd.Client, error) {
+					callCount++
+					return nil, errors.New("fake error")
+				},
+			},
+			expectedRetry: true,
+		},
+		{
+			name: "do not retry retryable errors when KCP is stable",
+			kcp: &controlplanev1.KubeadmControlPlane{
+				Spec: controlplanev1.KubeadmControlPlaneSpec{
+					Replicas: ptr.To(int32(1)),
+				},
+			},
+			machines: []*clusterv1.Machine{
+				fakeMachine("m1", withNodeRef("n1")),
+			},
+			injectClient: &fakeClient{
+				list: &corev1.NodeList{
+					Items: []corev1.Node{*fakeNode("n1")},
+				},
+			},
+			injectEtcdClientGenerator: &fakeEtcdClientGenerator{
+				forNodesClientFunc: func(_ []string) (*etcd.Client, error) {
+					callCount++
+					return nil, errors.New("fake error")
+				},
+			},
+			expectedRetry: false,
+		},
+		{
+			name: "do not retry for other errors when KCP is scaling up",
+			kcp: &controlplanev1.KubeadmControlPlane{
+				Spec: controlplanev1.KubeadmControlPlaneSpec{
+					Replicas: ptr.To(int32(3)),
+				},
+			},
+			machines: []*clusterv1.Machine{
+				fakeMachine("m1", withNodeRef("n1")),
+			},
+			injectClient: &fakeClient{
+				list: &corev1.NodeList{
+					Items: []corev1.Node{
+						*fakeNode("n1"),
+					},
+				},
+			},
+			injectEtcdClientGenerator: &fakeEtcdClientGenerator{
+				forNodesClientFunc: func(_ []string) (*etcd.Client, error) {
+					callCount++
+					return &etcd.Client{
+						EtcdClient: &fake2.FakeEtcdClient{
+							EtcdEndpoints: []string{},
+							MemberListResponse: &clientv3.MemberListResponse{
+								Header: &pb.ResponseHeader{
+									ClusterId: uint64(1),
+								},
+								Members: []*pb.Member{
+									{Name: "n1", ID: uint64(1)},
+								},
+							},
+							AlarmResponse: &clientv3.AlarmResponse{
+								Alarms: []*pb.AlarmMember{},
+							},
+						},
+					}, nil
+				},
+			},
+			expectedRetry: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			w := &Workload{
+				Client:              tt.injectClient,
+				etcdClientGenerator: tt.injectEtcdClientGenerator,
+			}
+			controlPane := &ControlPlane{
+				KCP:      tt.kcp,
+				Machines: collections.FromMachines(tt.machines...),
+			}
+
+			callCount = 0
+			w.UpdateEtcdConditions(ctx, controlPane)
+			if tt.expectedRetry {
+				// Note we keep the code implementing retry support so we can easily re-activate it if we need to.
+				//	g.Expect(callCount).To(Equal(3))
+				// } else {
+				g.Expect(callCount).To(Equal(1))
+			}
+		})
+	}
+}
+
+func TestUpdateManagedEtcdConditions(t *testing.T) {
 	tests := []struct {
 		name                                      string
 		kcp                                       *controlplanev1.KubeadmControlPlane
 		machines                                  []*clusterv1.Machine
 		injectClient                              client.Client // This test is injecting a fake client because it is required to create nodes with a controlled Status or to fail with a specific error.
 		injectEtcdClientGenerator                 etcdClientFor // This test is injecting a fake etcdClientGenerator because it is required to nodes with a controlled Status or to fail with a specific error.
+		expectedRetryableError                    bool
 		expectedKCPCondition                      *clusterv1.Condition
 		expectedKCPV1Beta2Condition               *metav1.Condition
 		expectedMachineConditions                 map[string]clusterv1.Conditions
@@ -66,7 +188,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 			injectClient: &fakeClient{
 				listErr: errors.New("failed to list Nodes"),
 			},
-			expectedKCPCondition: conditions.UnknownCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterInspectionFailedReason, "Failed to list Nodes which are hosting the etcd members"),
+			expectedRetryableError: false,
+			expectedKCPCondition:   conditions.UnknownCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterInspectionFailedReason, "Failed to list Nodes which are hosting the etcd members"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.UnknownCondition(controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberInspectionFailedReason, "Failed to get the Node which is hosting the etcd member"),
@@ -90,14 +213,15 @@ func TestUpdateEtcdConditions(t *testing.T) {
 		{
 			name: "If there are provisioning machines, a node without machine should be ignored in v1beta1, reported in v1beta2 (without providerID)",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m1"), // without NodeRef (provisioning)
+				fakeMachine("m1", withProviderID("n1")), // without NodeRef (provisioning)
 			},
 			injectClient: &fakeClient{
 				list: &corev1.NodeList{
 					Items: []corev1.Node{*fakeNode("n1")},
 				},
 			},
-			expectedKCPCondition: nil,
+			expectedRetryableError: false,
+			expectedKCPCondition:   nil,
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {},
 			},
@@ -106,11 +230,11 @@ func TestUpdateEtcdConditions(t *testing.T) {
 				Status: metav1.ConditionUnknown,
 				Reason: controlplanev1.KubeadmControlPlaneEtcdClusterHealthUnknownV1Beta2Reason,
 				Message: "* Machine m1:\n" +
-					"  * EtcdMemberHealthy: Waiting for GenericInfraMachine to report spec.providerID",
+					"  * EtcdMemberHealthy: Waiting for a Node with spec.providerID n1 to exist",
 			},
 			expectedMachineV1Beta2Conditions: map[string][]metav1.Condition{
 				"m1": {
-					{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberInspectionFailedV1Beta2Reason, Message: "Waiting for GenericInfraMachine to report spec.providerID"},
+					{Type: controlplanev1.KubeadmControlPlaneMachineEtcdMemberHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachineEtcdMemberInspectionFailedV1Beta2Reason, Message: "Waiting for a Node with spec.providerID n1 to exist"},
 				},
 			},
 			expectedEtcdMembersAgreeOnMemberList:      false, // without reading members, we can not make assumptions.
@@ -127,7 +251,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					Items: []corev1.Node{*fakeNode("n1")},
 				},
 			},
-			expectedKCPCondition: nil,
+			expectedRetryableError: false,
+			expectedKCPCondition:   nil,
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {},
 			},
@@ -155,7 +280,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					Items: []corev1.Node{*fakeNode("n1")},
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Control plane Node %s does not have a corresponding Machine", "n1"),
+			expectedRetryableError: false,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Control plane Node %s does not have a corresponding Machine", "n1"),
 			expectedKCPV1Beta2Condition: &metav1.Condition{
 				Type:    controlplanev1.KubeadmControlPlaneEtcdClusterHealthyV1Beta2Condition,
 				Status:  metav1.ConditionFalse,
@@ -169,7 +295,7 @@ func TestUpdateEtcdConditions(t *testing.T) {
 		{
 			name: "failure creating the etcd client should report unknown condition",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m1", withNodeRef("n1")),
+				fakeMachine("m1", withProviderID("n1"), withNodeRef("n1")),
 			},
 			injectClient: &fakeClient{
 				list: &corev1.NodeList{
@@ -179,7 +305,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 			injectEtcdClientGenerator: &fakeEtcdClientGenerator{
 				forNodesErr: errors.New("failed to get client for node"),
 			},
-			expectedKCPCondition: conditions.UnknownCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnknownReason, "Following Machines are reporting unknown etcd member status: m1"),
+			expectedRetryableError: true,
+			expectedKCPCondition:   conditions.UnknownCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnknownReason, "Following Machines are reporting unknown etcd member status: m1"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.UnknownCondition(controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberInspectionFailedReason, "Failed to connect to the etcd Pod on the %s Node: failed to get client for node", "n1"),
@@ -219,7 +346,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					Errors: []string{"some errors"},
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m1"),
+			expectedRetryableError: true,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m1"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.FalseCondition(controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Etcd member status reports errors: %s", "some errors"),
@@ -244,7 +372,7 @@ func TestUpdateEtcdConditions(t *testing.T) {
 		{
 			name: "failure listing members should report false condition in v1beta1, unknown in v1beta2",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m1", withNodeRef("n1")),
+				fakeMachine("m1", withProviderID("n1"), withNodeRef("n1")),
 			},
 			injectClient: &fakeClient{
 				list: &corev1.NodeList{
@@ -259,7 +387,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					},
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m1"),
+			expectedRetryableError: true,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m1"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.FalseCondition(controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Failed to get answer from the etcd member on the %s Node", "n1"),
@@ -308,7 +437,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					},
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m1"),
+			expectedRetryableError: false,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m1"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.FalseCondition(controlplanev1.MachineEtcdMemberHealthyCondition, controlplanev1.EtcdMemberUnhealthyReason, clusterv1.ConditionSeverityError, "Etcd member reports alarms: %s", "NOSPACE"),
@@ -389,7 +519,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					}
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m2"),
+			expectedRetryableError: false,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m2"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.TrueCondition(controlplanev1.MachineEtcdMemberHealthyCondition),
@@ -476,7 +607,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					}
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m2"),
+			expectedRetryableError: true,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m2"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.TrueCondition(controlplanev1.MachineEtcdMemberHealthyCondition),
@@ -545,7 +677,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					}
 				},
 			},
-			expectedKCPCondition: conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m2"),
+			expectedRetryableError: true,
+			expectedKCPCondition:   conditions.FalseCondition(controlplanev1.EtcdClusterHealthyCondition, controlplanev1.EtcdClusterUnhealthyReason, clusterv1.ConditionSeverityError, "Following Machines are reporting etcd member errors: %s", "m2"),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.TrueCondition(controlplanev1.MachineEtcdMemberHealthyCondition),
@@ -632,7 +765,8 @@ func TestUpdateEtcdConditions(t *testing.T) {
 					}
 				},
 			},
-			expectedKCPCondition: conditions.TrueCondition(controlplanev1.EtcdClusterHealthyCondition),
+			expectedRetryableError: false,
+			expectedKCPCondition:   conditions.TrueCondition(controlplanev1.EtcdClusterHealthyCondition),
 			expectedMachineConditions: map[string]clusterv1.Conditions{
 				"m1": {
 					*conditions.TrueCondition(controlplanev1.MachineEtcdMemberHealthyCondition),
@@ -659,25 +793,6 @@ func TestUpdateEtcdConditions(t *testing.T) {
 			expectedEtcdMembersAgreeOnClusterID:       true,
 			expectedEtcdMembersAndMachinesAreMatching: true,
 		},
-		{
-			name: "External etcd should set a condition at KCP level for v1beta1, not for v1beta2",
-			kcp: &controlplanev1.KubeadmControlPlane{
-				Spec: controlplanev1.KubeadmControlPlaneSpec{
-					KubeadmConfigSpec: bootstrapv1.KubeadmConfigSpec{
-						ClusterConfiguration: &bootstrapv1.ClusterConfiguration{
-							Etcd: bootstrapv1.Etcd{
-								External: &bootstrapv1.ExternalEtcd{},
-							},
-						},
-					},
-				},
-			},
-			expectedKCPCondition:                      conditions.TrueCondition(controlplanev1.EtcdClusterHealthyCondition),
-			expectedKCPV1Beta2Condition:               nil,
-			expectedEtcdMembersAgreeOnMemberList:      false,
-			expectedEtcdMembersAgreeOnClusterID:       false,
-			expectedEtcdMembersAndMachinesAreMatching: false,
-		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -694,7 +809,9 @@ func TestUpdateEtcdConditions(t *testing.T) {
 				KCP:      tt.kcp,
 				Machines: collections.FromMachines(tt.machines...),
 			}
-			w.UpdateEtcdConditions(ctx, controlPane)
+
+			retryableError := w.updateManagedEtcdConditions(ctx, controlPane)
+			g.Expect(retryableError).To(Equal(tt.expectedRetryableError))
 
 			if tt.expectedKCPCondition != nil {
 				g.Expect(*conditions.Get(tt.kcp, controlplanev1.EtcdClusterHealthyCondition)).To(conditions.MatchCondition(*tt.expectedKCPCondition))
@@ -718,6 +835,53 @@ func TestUpdateEtcdConditions(t *testing.T) {
 				membersNames = append(membersNames, m.Name)
 			}
 			g.Expect(membersNames).To(Equal(tt.expectedEtcdMembers))
+		})
+	}
+}
+
+func TestUpdateExternalEtcdConditions(t *testing.T) {
+	tests := []struct {
+		name                        string
+		kcp                         *controlplanev1.KubeadmControlPlane
+		expectedKCPCondition        *clusterv1.Condition
+		expectedKCPV1Beta2Condition *metav1.Condition
+	}{
+		{
+			name: "External etcd should set a condition at KCP level for v1beta1, not for v1beta2",
+			kcp: &controlplanev1.KubeadmControlPlane{
+				Spec: controlplanev1.KubeadmControlPlaneSpec{
+					KubeadmConfigSpec: bootstrapv1.KubeadmConfigSpec{
+						ClusterConfiguration: &bootstrapv1.ClusterConfiguration{
+							Etcd: bootstrapv1.Etcd{
+								External: &bootstrapv1.ExternalEtcd{},
+							},
+						},
+					},
+				},
+			},
+			expectedKCPCondition:        conditions.TrueCondition(controlplanev1.EtcdClusterHealthyCondition),
+			expectedKCPV1Beta2Condition: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			if tt.kcp == nil {
+				tt.kcp = &controlplanev1.KubeadmControlPlane{}
+			}
+			w := &Workload{}
+			controlPane := &ControlPlane{
+				KCP: tt.kcp,
+			}
+
+			w.updateExternalEtcdConditions(ctx, controlPane)
+			if tt.expectedKCPCondition != nil {
+				g.Expect(*conditions.Get(tt.kcp, controlplanev1.EtcdClusterHealthyCondition)).To(conditions.MatchCondition(*tt.expectedKCPCondition))
+			}
+			if tt.expectedKCPV1Beta2Condition != nil {
+				g.Expect(*v1beta2conditions.Get(tt.kcp, controlplanev1.KubeadmControlPlaneEtcdClusterHealthyV1Beta2Condition)).To(v1beta2conditions.MatchCondition(*tt.expectedKCPV1Beta2Condition, v1beta2conditions.IgnoreLastTransitionTime(true)))
+			}
 		})
 	}
 }
@@ -800,14 +964,10 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 				"m1": {},
 			},
 			expectedKCPV1Beta2Condition: metav1.Condition{
-				Type:   controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthyV1Beta2Condition,
-				Status: metav1.ConditionUnknown,
-				Reason: controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthUnknownV1Beta2Reason,
-				Message: "* Machine m1:\n" +
-					"  * APIServerPodHealthy: Waiting for GenericInfraMachine to report spec.providerID\n" +
-					"  * ControllerManagerPodHealthy: Waiting for GenericInfraMachine to report spec.providerID\n" +
-					"  * SchedulerPodHealthy: Waiting for GenericInfraMachine to report spec.providerID\n" +
-					"  * EtcdPodHealthy: Waiting for GenericInfraMachine to report spec.providerID",
+				Type:    controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthyV1Beta2Condition,
+				Status:  metav1.ConditionTrue,
+				Reason:  controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthyV1Beta2Reason,
+				Message: "",
 			},
 			expectedMachineV1Beta2Conditions: map[string][]metav1.Condition{
 				"m1": {
@@ -837,10 +997,7 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 				Status: metav1.ConditionUnknown,
 				Reason: controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthUnknownV1Beta2Reason,
 				Message: "* Machine m1:\n" +
-					"  * APIServerPodHealthy: Waiting for a Node with spec.providerID dummy-provider-id to exist\n" +
-					"  * ControllerManagerPodHealthy: Waiting for a Node with spec.providerID dummy-provider-id to exist\n" +
-					"  * SchedulerPodHealthy: Waiting for a Node with spec.providerID dummy-provider-id to exist\n" +
-					"  * EtcdPodHealthy: Waiting for a Node with spec.providerID dummy-provider-id to exist",
+					"  * Control plane components: Waiting for a Node with spec.providerID dummy-provider-id to exist",
 			},
 			expectedMachineV1Beta2Conditions: map[string][]metav1.Condition{
 				"m1": {
@@ -870,7 +1027,7 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 		{
 			name: "A node with unreachable taint should report all the conditions Unknown",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m1", withNodeRef("n1")),
+				fakeMachine("m1", withProviderID("n1"), withNodeRef("n1")),
 			},
 			injectClient: &fakeClient{
 				list: &corev1.NodeList{
@@ -891,10 +1048,7 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 				Status: metav1.ConditionUnknown,
 				Reason: controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthUnknownV1Beta2Reason,
 				Message: "* Machine m1:\n" +
-					"  * APIServerPodHealthy: Node n1 is unreachable\n" +
-					"  * ControllerManagerPodHealthy: Node n1 is unreachable\n" +
-					"  * SchedulerPodHealthy: Node n1 is unreachable\n" +
-					"  * EtcdPodHealthy: Node n1 is unreachable",
+					"  * Control plane components: Node n1 is unreachable",
 			},
 			expectedMachineV1Beta2Conditions: map[string][]metav1.Condition{
 				"m1": {
@@ -908,7 +1062,7 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 		{
 			name: "A provisioning machine without node should be ignored in v1beta1, should surface in v1beta2",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m1"), // without NodeRef (provisioning)
+				fakeMachine("m1", withProviderID("n1")), // without NodeRef (provisioning)
 			},
 			injectClient: &fakeClient{
 				list: &corev1.NodeList{},
@@ -922,24 +1076,21 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 				Status: metav1.ConditionUnknown,
 				Reason: controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthUnknownV1Beta2Reason,
 				Message: "* Machine m1:\n" +
-					"  * APIServerPodHealthy: Waiting for GenericInfraMachine to report spec.providerID\n" +
-					"  * ControllerManagerPodHealthy: Waiting for GenericInfraMachine to report spec.providerID\n" +
-					"  * SchedulerPodHealthy: Waiting for GenericInfraMachine to report spec.providerID\n" +
-					"  * EtcdPodHealthy: Waiting for GenericInfraMachine to report spec.providerID",
+					"  * Control plane components: Waiting for a Node with spec.providerID n1 to exist",
 			},
 			expectedMachineV1Beta2Conditions: map[string][]metav1.Condition{
 				"m1": {
-					{Type: controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for GenericInfraMachine to report spec.providerID"},
-					{Type: controlplanev1.KubeadmControlPlaneMachineControllerManagerPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for GenericInfraMachine to report spec.providerID"},
-					{Type: controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for GenericInfraMachine to report spec.providerID"},
-					{Type: controlplanev1.KubeadmControlPlaneMachineSchedulerPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for GenericInfraMachine to report spec.providerID"},
+					{Type: controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for a Node with spec.providerID n1 to exist"},
+					{Type: controlplanev1.KubeadmControlPlaneMachineControllerManagerPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for a Node with spec.providerID n1 to exist"},
+					{Type: controlplanev1.KubeadmControlPlaneMachineEtcdPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for a Node with spec.providerID n1 to exist"},
+					{Type: controlplanev1.KubeadmControlPlaneMachineSchedulerPodHealthyV1Beta2Condition, Status: metav1.ConditionUnknown, Reason: controlplanev1.KubeadmControlPlaneMachinePodInspectionFailedV1Beta2Reason, Message: "Waiting for a Node with spec.providerID n1 to exist"},
 				},
 			},
 		},
 		{
 			name: "A provisioned machine without node should report all the conditions as false in v1beta1, unknown in v1beta2",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m1", withNodeRef("n1")),
+				fakeMachine("m1", withProviderID("n1"), withNodeRef("n1")),
 			},
 			injectClient: &fakeClient{
 				list: &corev1.NodeList{},
@@ -958,10 +1109,7 @@ func TestUpdateStaticPodConditions(t *testing.T) {
 				Status: metav1.ConditionUnknown,
 				Reason: controlplanev1.KubeadmControlPlaneControlPlaneComponentsHealthUnknownV1Beta2Reason,
 				Message: "* Machine m1:\n" +
-					"  * APIServerPodHealthy: Node n1 does not exist\n" +
-					"  * ControllerManagerPodHealthy: Node n1 does not exist\n" +
-					"  * SchedulerPodHealthy: Node n1 does not exist\n" +
-					"  * EtcdPodHealthy: Node n1 does not exist",
+					"  * Control plane components: Node n1 does not exist",
 			},
 			expectedMachineV1Beta2Conditions: map[string][]metav1.Condition{
 				"m1": {
@@ -1208,7 +1356,7 @@ func TestUpdateStaticPodCondition(t *testing.T) {
 				Type:    v1beta2Condition,
 				Status:  metav1.ConditionFalse,
 				Reason:  controlplanev1.KubeadmControlPlaneMachinePodDoesNotExistV1Beta2Reason,
-				Message: "Pod kube-component-node does not exist",
+				Message: "Pod does not exist",
 			},
 		},
 		{
@@ -1694,7 +1842,7 @@ func TestAggregateV1Beta2ConditionsFromMachinesToKCP(t *testing.T) {
 			name: "kcp machines with errors",
 			machines: []*clusterv1.Machine{
 				fakeMachine("m2", withMachineReadyV1beta2Condition(metav1.ConditionFalse)), // machines are intentionally not ordered
-				fakeMachine("m4", withMachineReadyV1beta2Condition(metav1.ConditionUnknown)),
+				fakeMachine("m4", withMachineReadyV1beta2Condition(metav1.ConditionUnknown), withProviderID("m4")),
 				fakeMachine("m1", withMachineReadyV1beta2Condition(metav1.ConditionFalse)),
 				fakeMachine("m3", withMachineReadyV1beta2Condition(metav1.ConditionTrue)),
 			},
@@ -1724,8 +1872,8 @@ func TestAggregateV1Beta2ConditionsFromMachinesToKCP(t *testing.T) {
 		{
 			name: "kcp machines with unknown",
 			machines: []*clusterv1.Machine{
-				fakeMachine("m3", withMachineReadyV1beta2Condition(metav1.ConditionUnknown)), // machines are intentionally not ordered
-				fakeMachine("m1", withMachineReadyV1beta2Condition(metav1.ConditionUnknown)),
+				fakeMachine("m3", withMachineReadyV1beta2Condition(metav1.ConditionUnknown), withProviderID("m1")), // machines are intentionally not ordered
+				fakeMachine("m1", withMachineReadyV1beta2Condition(metav1.ConditionUnknown), withProviderID("m1")),
 				fakeMachine("m2", withMachineReadyV1beta2Condition(metav1.ConditionTrue)),
 			},
 			expectedCondition: metav1.Condition{
@@ -1734,6 +1882,20 @@ func TestAggregateV1Beta2ConditionsFromMachinesToKCP(t *testing.T) {
 				Reason: unknownReason,
 				Message: "* Machines m1, m3:\n" +
 					"  * Ready: ready condition is Unknown",
+			},
+		},
+		{
+			name: "kcp machines with unknown but without provided ID are ignored",
+			machines: []*clusterv1.Machine{
+				fakeMachine("m3", withMachineReadyV1beta2Condition(metav1.ConditionUnknown)), // machines are intentionally not ordered
+				fakeMachine("m1", withMachineReadyV1beta2Condition(metav1.ConditionUnknown)),
+				fakeMachine("m2", withMachineReadyV1beta2Condition(metav1.ConditionTrue)),
+			},
+			expectedCondition: metav1.Condition{
+				Type:    conditionType,
+				Status:  metav1.ConditionTrue,
+				Reason:  trueReason,
+				Message: "",
 			},
 		},
 		{

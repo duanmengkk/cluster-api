@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -42,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -111,6 +113,8 @@ type Reconciler struct {
 	// specific time for a specific Request. This is used to implement rate-limiting to avoid
 	// e.g. spamming workload clusters with eviction requests during Node drain.
 	reconcileDeleteCache cache.Cache[cache.ReconcileEntry]
+
+	predicateLog *logr.Logger
 }
 
 func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
@@ -122,7 +126,7 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 		return errors.New("Client, APIReader and ClusterCache must not be nil and RemoteConditionsGracePeriod must not be < 2m")
 	}
 
-	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "machine")
+	r.predicateLog = ptr.To(ctrl.LoggerFrom(ctx).WithValues("controller", "machine"))
 	clusterToMachines, err := util.ClusterToTypedObjectsMapper(mgr.GetClient(), &clusterv1.MachineList{}, mgr.GetScheme())
 	if err != nil {
 		return err
@@ -139,29 +143,31 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 	if r.nodeDeletionRetryTimeout.Nanoseconds() == 0 {
 		r.nodeDeletionRetryTimeout = 10 * time.Second
 	}
-
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.Machine{}).
 		WithOptions(options).
-		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue)).
+		WithEventFilter(predicates.ResourceHasFilterLabel(mgr.GetScheme(), *r.predicateLog, r.WatchFilterValue)).
 		Watches(
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(clusterToMachines),
 			builder.WithPredicates(
 				// TODO: should this wait for Cluster.Status.InfrastructureReady similar to Infra Machine resources?
-				predicates.All(mgr.GetScheme(), predicateLog,
-					predicates.ClusterControlPlaneInitialized(mgr.GetScheme(), predicateLog),
-					predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
+				predicates.All(mgr.GetScheme(), *r.predicateLog,
+					predicates.ResourceIsChanged(mgr.GetScheme(), *r.predicateLog),
+					predicates.ClusterControlPlaneInitialized(mgr.GetScheme(), *r.predicateLog),
+					predicates.ResourceHasFilterLabel(mgr.GetScheme(), *r.predicateLog, r.WatchFilterValue),
 				),
 			)).
 		WatchesRawSource(r.ClusterCache.GetClusterSource("machine", clusterToMachines, clustercache.WatchForProbeFailure(r.RemoteConditionsGracePeriod))).
 		Watches(
 			&clusterv1.MachineSet{},
 			handler.EnqueueRequestsFromMapFunc(msToMachines),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), *r.predicateLog)),
 		).
 		Watches(
 			&clusterv1.MachineDeployment{},
 			handler.EnqueueRequestsFromMapFunc(mdToMachines),
+			builder.WithPredicates(predicates.ResourceIsChanged(mgr.GetScheme(), *r.predicateLog)),
 		).
 		Build(r)
 	if err != nil {
@@ -174,7 +180,7 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 		Controller:      c,
 		Cache:           mgr.GetCache(),
 		Scheme:          mgr.GetScheme(),
-		PredicateLogger: &predicateLog,
+		PredicateLogger: r.predicateLog,
 	}
 	r.ssaCache = ssa.NewCache()
 	r.reconcileDeleteCache = cache.New[cache.ReconcileEntry]()
@@ -218,6 +224,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 
 	if isPaused, conditionChanged, err := paused.EnsurePausedCondition(ctx, r.Client, cluster, m); err != nil || isPaused || conditionChanged {
 		return ctrl.Result{}, err
+	}
+
+	if !m.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Check reconcileDeleteCache to ensure we won't run reconcileDelete too frequently.
+		// Note: The reconcileDelete func will add entries to the cache.
+		if cacheEntry, ok := r.reconcileDeleteCache.Has(cache.NewReconcileEntryKey(m)); ok {
+			if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
+				return ctrl.Result{RequeueAfter: requeueAfter}, nil
+			}
+		}
 	}
 
 	s := &scope{
@@ -418,13 +434,6 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	cluster := s.cluster
 	m := s.machine
 
-	// Check reconcileDeleteCache to ensure we won't run reconcileDelete too frequently.
-	if cacheEntry, ok := r.reconcileDeleteCache.Has(cache.NewReconcileEntryKey(s.machine)); ok {
-		if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
-			return ctrl.Result{RequeueAfter: requeueAfter}, nil
-		}
-	}
-
 	s.reconcileDeleteExecuted = true
 
 	// Add entry to the reconcileDeleteCache so we won't run reconcileDelete more than once per second.
@@ -560,6 +569,7 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 				hooks = append(hooks, key)
 			}
 		}
+		slices.Sort(hooks)
 		log.Info("Waiting for pre-terminate hooks to succeed", "hooks", strings.Join(hooks, ","))
 		conditions.MarkFalse(m, clusterv1.PreTerminateDeleteHookSucceededCondition, clusterv1.WaitingExternalHookReason, clusterv1.ConditionSeverityInfo, "")
 		s.deletingReason = clusterv1.MachineDeletingWaitingForPreTerminateHookV1Beta2Reason
@@ -630,7 +640,21 @@ func (r *Reconciler) reconcileDelete(ctx context.Context, s *scope) (ctrl.Result
 	return ctrl.Result{}, nil
 }
 
+const (
+	// KubeadmControlPlaneAPIVersion inlined from KCP (we want to avoid importing the KCP API package).
+	KubeadmControlPlaneAPIVersion = "controlplane.cluster.x-k8s.io/v1beta1"
+
+	// KubeadmControlPlanePreTerminateHookCleanupAnnotation inlined from KCP (we want to avoid importing the KCP API package).
+	KubeadmControlPlanePreTerminateHookCleanupAnnotation = clusterv1.PreTerminateDeleteHookAnnotationPrefix + "/kcp-cleanup"
+)
+
 func (r *Reconciler) isNodeDrainAllowed(m *clusterv1.Machine) bool {
+	if util.IsControlPlaneMachine(m) && util.HasOwner(m.GetOwnerReferences(), KubeadmControlPlaneAPIVersion, []string{"KubeadmControlPlane"}) {
+		if _, exists := m.Annotations[KubeadmControlPlanePreTerminateHookCleanupAnnotation]; !exists {
+			return false
+		}
+	}
+
 	if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeNodeDrainingAnnotation]; exists {
 		return false
 	}
@@ -645,6 +669,12 @@ func (r *Reconciler) isNodeDrainAllowed(m *clusterv1.Machine) bool {
 // isNodeVolumeDetachingAllowed returns False if either ExcludeWaitForNodeVolumeDetachAnnotation annotation is set OR
 // nodeVolumeDetachTimeoutExceeded timeout is exceeded, otherwise returns True.
 func (r *Reconciler) isNodeVolumeDetachingAllowed(m *clusterv1.Machine) bool {
+	if util.IsControlPlaneMachine(m) && util.HasOwner(m.GetOwnerReferences(), KubeadmControlPlaneAPIVersion, []string{"KubeadmControlPlane"}) {
+		if _, exists := m.Annotations[KubeadmControlPlanePreTerminateHookCleanupAnnotation]; !exists {
+			return false
+		}
+	}
+
 	if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeWaitForNodeVolumeDetachAnnotation]; exists {
 		return false
 	}
@@ -733,7 +763,7 @@ func (r *Reconciler) isDeleteNodeAllowed(ctx context.Context, cluster *clusterv1
 	// controlPlaneRef is an optional field in the Cluster so skip the external
 	// managed control plane check if it is nil
 	if cluster.Spec.ControlPlaneRef != nil {
-		controlPlane, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef, cluster.Spec.ControlPlaneRef.Namespace)
+		controlPlane, err := external.Get(ctx, r.Client, cluster.Spec.ControlPlaneRef)
 		if apierrors.IsNotFound(err) {
 			// If control plane object in the reference does not exist, log and skip check for
 			// external managed control plane
@@ -1057,6 +1087,7 @@ func (r *Reconciler) watchClusterNodes(ctx context.Context, cluster *clusterv1.C
 		Watcher:      r.controller,
 		Kind:         &corev1.Node{},
 		EventHandler: handler.EnqueueRequestsFromMapFunc(r.nodeToMachine),
+		Predicates:   []predicate.TypedPredicate[client.Object]{predicates.TypedResourceIsChanged[client.Object](r.Client.Scheme(), *r.predicateLog)},
 	}))
 }
 
